@@ -134,8 +134,8 @@ pub fn acceptClient(listen_fd: std.posix.fd_t) !std.posix.fd_t {
 /// Read a complete message from client fd into buf.
 /// Returns msg_type + payload slice, or null if EOF/disconnect.
 /// Returns error.WouldBlock if no data available yet (EAGAIN) AND no bytes have been read.
-/// Once partial data is received, retries instead of returning WouldBlock to prevent
-/// stream desynchronization on non-blocking sockets.
+/// If partial data was consumed and WouldBlock occurs, returns null (disconnect) to avoid
+/// busy-looping on the single-threaded event loop.
 pub fn readMessage(fd: std.posix.fd_t, buf: []u8) error{WouldBlock}!?struct { msg_type: u32, payload: []const u8 } {
     if (buf.len < HEADER_SIZE) return null;
 
@@ -144,10 +144,8 @@ pub fn readMessage(fd: std.posix.fd_t, buf: []u8) error{WouldBlock}!?struct { ms
     while (total_read < HEADER_SIZE) {
         const n = std.posix.read(fd, buf[total_read..]) catch |err| {
             if (err == error.WouldBlock) {
-                // Only return WouldBlock if we haven't read anything yet.
-                // If partial data was consumed, we must finish reading to stay in sync.
                 if (total_read == 0) return error.WouldBlock;
-                continue; // Retry — data should arrive shortly on UNIX domain socket
+                return null; // Partial header + WouldBlock: drop client to avoid busy-loop
             }
             return null;
         };
@@ -165,7 +163,7 @@ pub fn readMessage(fd: std.posix.fd_t, buf: []u8) error{WouldBlock}!?struct { ms
     // Read payload — once header is read, we must complete the message
     while (total_read < total_needed) {
         const n = std.posix.read(fd, buf[total_read..total_needed]) catch |err| {
-            if (err == error.WouldBlock) continue; // Retry — must finish reading payload
+            if (err == error.WouldBlock) return null; // Partial payload: drop client to avoid busy-loop
             return null;
         };
         if (n == 0) return null;

@@ -79,8 +79,8 @@ fn jsonEscapeWrite(w: anytype, s: []const u8) !void {
 fn getWorkspaceOutputName(ws: *tree.Container) []const u8 {
     if (ws.parent) |parent| {
         if (parent.type == .output) {
-            if (parent.workspace) |wsd| {
-                if (wsd.output_name.len > 0) return wsd.output_name;
+            if (parent.output_data) |od| {
+                if (od.name.len > 0) return od.name;
             }
         }
     }
@@ -317,17 +317,13 @@ fn sendTakeFocus(ctx: *EventContext, window: xcb.Window) void {
     if (!supports_take_focus) return;
 
     // Send WM_TAKE_FOCUS client message
-    var event_data: xcb.c.xcb_client_message_event_t = undefined;
+    var event_data: xcb.c.xcb_client_message_event_t = std.mem.zeroes(xcb.c.xcb_client_message_event_t);
     event_data.response_type = xcb.CLIENT_MESSAGE;
     event_data.format = 32;
-    event_data.sequence = 0;
     event_data.window = window;
     event_data.type = ctx.atoms.wm_protocols;
     event_data.data.data32[0] = ctx.atoms.wm_take_focus;
     event_data.data.data32[1] = xcb.CURRENT_TIME;
-    event_data.data.data32[2] = 0;
-    event_data.data.data32[3] = 0;
-    event_data.data.data32[4] = 0;
 
     _ = xcb.sendEvent(ctx.conn, 0, window, xcb.EVENT_MASK_NO_EVENT, @ptrCast(&event_data));
 }
@@ -722,7 +718,7 @@ fn readAllWindowPropertiesBatched(allocator: std.mem.Allocator, conn: *xcb.Conne
     const transient_cookie = xcb.getProperty(conn, 0, window, xcb.ATOM_WM_TRANSIENT_FOR, xcb.ATOM_WINDOW, 0, 1);
     const type_cookie = xcb.getProperty(conn, 0, window, atoms.net_wm_window_type, xcb.ATOM_ATOM, 0, 32);
     const role_cookie = xcb.getProperty(conn, 0, window, atoms.wm_window_role, xcb.ATOM_STRING, 0, 256);
-    const hints_cookie = xcb.getProperty(conn, 0, window, xcb.ATOM_WM_NORMAL_HINTS, xcb.ATOM_WM_NORMAL_HINTS, 0, 18);
+    const hints_cookie = xcb.getProperty(conn, 0, window, xcb.ATOM_WM_NORMAL_HINTS, xcb.ATOM_WM_SIZE_HINTS, 0, 18);
 
     var props = BatchedWindowProps{};
 
@@ -1731,45 +1727,58 @@ fn handleExpose(ctx: *EventContext, ev: *xcb.c.xcb_expose_event_t) void {
 
 // --- Command execution ---
 
-/// Collect containers matching criteria (max 64). Walks tree depth-first.
-fn collectMatchingContainers(root: *tree.Container, crit: *const criteria.Criteria, out: *[64]*tree.Container) usize {
+/// Collect window IDs of containers matching criteria (max 64). Walks tree depth-first.
+/// Uses window IDs instead of raw pointers so commands that destroy/move containers
+/// don't cause dangling pointer access.
+fn collectMatchingWindowIds(root: *tree.Container, crit: *const criteria.Criteria, out: *[64]xcb.Window) usize {
     var count: usize = 0;
-    collectMatchingRecursive(root, crit, out, &count);
+    collectMatchingWindowIdsRecursive(root, crit, out, &count);
     return count;
 }
 
-fn collectMatchingRecursive(con: *tree.Container, crit: *const criteria.Criteria, out: *[64]*tree.Container, count: *usize) void {
+fn collectMatchingWindowIdsRecursive(con: *tree.Container, crit: *const criteria.Criteria, out: *[64]xcb.Window, count: *usize) void {
     if (count.* >= 64) return;
     if (criteria.matches(crit, con)) {
-        out[count.*] = con;
-        count.* += 1;
+        if (con.window) |wd| {
+            out[count.*] = wd.id;
+            count.* += 1;
+        }
     }
     var cur = con.children.first;
     while (cur) |child| : (cur = child.next) {
-        collectMatchingRecursive(child, crit, out, count);
+        collectMatchingWindowIdsRecursive(child, crit, out, count);
     }
 }
 
 pub fn executeCommand(ctx: *EventContext, cmd: command_mod.Command) void {
     // If command has criteria, execute on all matching containers instead of focused
     if (cmd.criteria) |crit| {
-        var matches_buf: [64]*tree.Container = undefined;
-        const match_count = collectMatchingContainers(ctx.tree_root, &crit, &matches_buf);
+        var window_ids: [64]xcb.Window = undefined;
+        const match_count = collectMatchingWindowIds(ctx.tree_root, &crit, &window_ids);
         if (match_count == 0) return;
 
-        // For each matching container, temporarily make it the focused container,
-        // execute the command, then restore focus. This matches i3 behavior.
-        const original_focused = getFocusedContainer(ctx.tree_root);
-        for (matches_buf[0..match_count]) |target| {
-            // Set temporary focus for the command execution
+        // Save original focused window ID for restoration
+        const original_focused_wid: ?xcb.Window = if (getFocusedContainer(ctx.tree_root)) |fc|
+            (if (fc.window) |wd| wd.id else null)
+        else
+            null;
+
+        for (window_ids[0..match_count]) |wid| {
+            // Re-resolve container from window ID — it may have been destroyed by a prior command
+            const target = findContainerByWindow(ctx, wid) orelse continue;
             setFocus(ctx, target);
             var cmd_no_crit = cmd;
             cmd_no_crit.criteria = null;
             executeCommand(ctx, cmd_no_crit);
         }
-        // Restore original focus if it's still valid
-        if (original_focused) |orig| {
-            setFocus(ctx, orig);
+        // Restore original focus only if the original window still exists and
+        // the command was not a focus command (i3 behavior: [criteria] focus keeps new focus)
+        if (cmd.type != .focus) {
+            if (original_focused_wid) |wid| {
+                if (findContainerByWindow(ctx, wid)) |orig| {
+                    setFocus(ctx, orig);
+                }
+            }
         }
         return;
     }
@@ -2651,9 +2660,10 @@ fn executeMoveWorkspaceToOutput(ctx: *EventContext, cmd: command_mod.Command) vo
     // Update workspace output_name to match target output (must dupe to avoid aliased ownership)
     if (current_ws.workspace) |*wsd| {
         if (target_out.output_data) |od| {
-            // Free old output_name before replacing (skip empty string literals)
-            if (wsd.output_name.len > 0) ctx.allocator.free(wsd.output_name);
-            wsd.output_name = ctx.allocator.dupe(u8, od.name) catch od.name;
+            if (ctx.allocator.dupe(u8, od.name)) |new_name| {
+                if (wsd.output_name.len > 0) ctx.allocator.free(wsd.output_name);
+                wsd.output_name = new_name;
+            } else |_| {} // OOM: keep old output_name rather than aliasing
         }
     }
 

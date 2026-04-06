@@ -344,9 +344,10 @@ fn buildConfigJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
     _ = ctx;
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
-    // Return config file path if known, empty config otherwise (matches i3 behavior)
+    // i3 GET_CONFIG returns file contents in the "config" field
     w.writeAll("{\"config\":\"") catch return "{}";
-    // Try to find the config file path
+
+    // Search same paths as loadConfig
     const home = std.posix.getenv("HOME") orelse "";
     const xdg_config = std.posix.getenv("XDG_CONFIG_HOME");
     var path_buf: [512]u8 = undefined;
@@ -355,11 +356,34 @@ fn buildConfigJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
             const len = (std.fmt.bufPrint(&path_buf, "{s}/zephwm/config", .{xdg}) catch break :blk "").len;
             if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
         }
-        const len = (std.fmt.bufPrint(&path_buf, "{s}/.config/zephwm/config", .{home}) catch break :blk "").len;
-        if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+        {
+            const len = (std.fmt.bufPrint(&path_buf, "{s}/.config/zephwm/config", .{home}) catch break :blk "").len;
+            if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+        }
+        {
+            const len = (std.fmt.bufPrint(&path_buf, "{s}/.zephwm/config", .{home}) catch break :blk "").len;
+            if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+        }
+        if (std.fs.cwd().access("/etc/zephwm/config", .{})) |_| {
+            const etc = "/etc/zephwm/config";
+            @memcpy(path_buf[0..etc.len], etc);
+            break :blk path_buf[0..etc.len];
+        } else |_| {}
         break :blk "";
     };
-    jsonEscapeWrite(w, config_path) catch return "{}";
+
+    // Read and emit file contents (not the path)
+    if (config_path.len > 0) {
+        if (std.fs.cwd().openFile(config_path, .{})) |file| {
+            defer file.close();
+            var read_buf: [4096]u8 = undefined;
+            while (true) {
+                const n = file.read(&read_buf) catch break;
+                if (n == 0) break;
+                jsonEscapeWrite(w, read_buf[0..n]) catch return "{}";
+            }
+        } else |_| {}
+    }
     w.writeAll("\"}") catch return "{}";
     return fbs.getWritten();
 }
