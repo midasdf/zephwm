@@ -41,6 +41,9 @@ pub const WindowData = struct {
     last_color: u32 = 0xFFFFFFFF,
     /// Set by applyWindow when geometry changed. Used by sendConfigureNotifyChanged.
     geometry_changed: bool = true,
+    /// WM_NORMAL_HINTS minimum size constraints (0 = no constraint)
+    min_w: u32 = 0,
+    min_h: u32 = 0,
 };
 
 pub const WorkspaceData = struct {
@@ -48,6 +51,10 @@ pub const WorkspaceData = struct {
     num: ?i32 = null,
     output_name: []const u8 = "",
     urgent: bool = false,
+};
+
+pub const OutputData = struct {
+    name: []const u8,
 };
 
 pub const ChildList = struct {
@@ -135,6 +142,7 @@ pub const Container = struct {
     window_rect: Rect = .{},
     window: ?WindowData = null,
     workspace: ?WorkspaceData = null,
+    output_data: ?OutputData = null,
     percent: f32 = 0.0,
     is_floating: bool = false,
     is_fullscreen: FullscreenMode = .none,
@@ -184,6 +192,10 @@ pub const Container = struct {
         if (self.workspace) |wsd| {
             freeOwnedString(alloc, wsd.name);
             freeOwnedString(alloc, wsd.output_name);
+        }
+        // Free allocator-owned output data
+        if (self.output_data) |od| {
+            freeOwnedString(alloc, od.name);
         }
         // Free allocator-owned mark strings
         for (self.marks[0..self.mark_count]) |mark_opt| {

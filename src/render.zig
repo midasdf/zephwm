@@ -310,11 +310,11 @@ fn applyRecursive(
                 con.children.len() > 1;
 
             // Single pass: process tiling, collect floating/fullscreen/border-normal
-            var floating_buf: [32]*tree.Container = undefined;
+            var floating_buf: [128]*tree.Container = undefined;
             var floating_count: usize = 0;
-            var fullscreen_buf: [8]*tree.Container = undefined;
+            var fullscreen_buf: [32]*tree.Container = undefined;
             var fullscreen_count: usize = 0;
-            var normal_border_buf: [32]*tree.Container = undefined;
+            var normal_border_buf: [128]*tree.Container = undefined;
             var normal_border_count: usize = 0;
 
             // For tabbed/stacked: pre-count tiling children, find focused tiling
@@ -338,14 +338,14 @@ fn applyRecursive(
             var cur = con.children.first;
             while (cur) |child| : (cur = child.next) {
                 if (child.is_fullscreen != .none) {
-                    if (fullscreen_count < 8) {
+                    if (fullscreen_count < fullscreen_buf.len) {
                         fullscreen_buf[fullscreen_count] = child;
                         fullscreen_count += 1;
                     }
                     continue;
                 }
                 if (child.is_floating) {
-                    if (floating_count < 32) {
+                    if (floating_count < floating_buf.len) {
                         floating_buf[floating_count] = child;
                         floating_count += 1;
                     }
@@ -370,7 +370,7 @@ fn applyRecursive(
                     applyRecursive(conn, child, border_focus_color, border_unfocus_color);
                     // Collect border normal windows inline (avoid second pass)
                     if (child.type == .window and child.border_style == .normal) {
-                        if (normal_border_count < 32) {
+                        if (normal_border_count < normal_border_buf.len) {
                             normal_border_buf[normal_border_count] = child;
                             normal_border_count += 1;
                         }

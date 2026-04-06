@@ -371,10 +371,12 @@ pub const KeyMap = struct {
 
     fn keysymData(self: *const KeyMap) []const Keysym {
         const total: usize = @as(usize, self.max_keycode - self.min_keycode + 1) * self.keysyms_per_keycode;
-        const ptr: [*]const Keysym = @ptrCast(@alignCast(
-            @as([*]const u8, @ptrCast(self.reply)) + @sizeOf(c.xcb_get_keyboard_mapping_reply_t),
-        ));
-        return ptr[0..total];
+        if (total == 0) return &.{};
+        // Use the XCB protocol accessor (ABI-safe, no manual pointer arithmetic)
+        const xcb_len: usize = @intCast(c.xcb_get_keyboard_mapping_keysyms_length(self.reply));
+        const safe_total = @min(total, xcb_len);
+        const ptr: [*]const Keysym = @ptrCast(c.xcb_get_keyboard_mapping_keysyms(self.reply));
+        return ptr[0..safe_total];
     }
 
     pub fn getKeysym(self: *const KeyMap, keycode: Keycode, col: u8) Keysym {

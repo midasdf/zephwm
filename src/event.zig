@@ -285,11 +285,51 @@ fn setFocus(ctx: *EventContext, con: *tree.Container) void {
     // Set X11 input focus
     if (con.window) |wd| {
         _ = xcb.setInputFocus(ctx.conn, xcb.INPUT_FOCUS_POINTER_ROOT, wd.id, xcb.CURRENT_TIME);
+        // Send WM_TAKE_FOCUS if the window supports it (ICCCM focus protocol)
+        sendTakeFocus(ctx, wd.id);
         updateActiveWindow(ctx, wd.id);
     } else {
         // No window (e.g. focusing a workspace) — clear active window
         updateActiveWindow(ctx, xcb.WINDOW_NONE);
     }
+}
+
+/// Send WM_TAKE_FOCUS ClientMessage if the window supports it (ICCCM).
+fn sendTakeFocus(ctx: *EventContext, window: xcb.Window) void {
+    // Check if window supports WM_TAKE_FOCUS in WM_PROTOCOLS
+    const cookie = xcb.getProperty(ctx.conn, 0, window, ctx.atoms.wm_protocols, xcb.ATOM_ATOM, 0, 32);
+    const reply = xcb.getPropertyReply(ctx.conn, cookie, null) orelse return;
+    defer std.c.free(reply);
+
+    const len = xcb.getPropertyValueLength(reply);
+    if (len <= 0) return;
+    const ptr = xcb.getPropertyValue(reply) orelse return;
+    const atoms_list: [*]const xcb.Atom = @ptrCast(@alignCast(ptr));
+    const count: usize = @intCast(@divTrunc(len, 4));
+
+    var supports_take_focus = false;
+    for (atoms_list[0..count]) |atom| {
+        if (atom == ctx.atoms.wm_take_focus) {
+            supports_take_focus = true;
+            break;
+        }
+    }
+    if (!supports_take_focus) return;
+
+    // Send WM_TAKE_FOCUS client message
+    var event_data: xcb.c.xcb_client_message_event_t = undefined;
+    event_data.response_type = xcb.CLIENT_MESSAGE;
+    event_data.format = 32;
+    event_data.sequence = 0;
+    event_data.window = window;
+    event_data.type = ctx.atoms.wm_protocols;
+    event_data.data.data32[0] = ctx.atoms.wm_take_focus;
+    event_data.data.data32[1] = xcb.CURRENT_TIME;
+    event_data.data.data32[2] = 0;
+    event_data.data.data32[3] = 0;
+    event_data.data.data32[4] = 0;
+
+    _ = xcb.sendEvent(ctx.conn, 0, window, xcb.EVENT_MASK_NO_EVENT, @ptrCast(&event_data));
 }
 
 /// Clear is_focused along the currently focused path only. O(depth).
@@ -446,11 +486,11 @@ pub fn relayoutAndRender(ctx: *EventContext) void {
 /// Collect all managed window IDs and set _NET_CLIENT_LIST on the root window.
 pub fn updateClientList(ctx: *EventContext) void {
     // Build client list from window_map (O(n) where n = managed windows, no tree walk)
-    var ids: [1024]u32 = undefined;
+    var ids: [4096]u32 = undefined;
     var count: usize = 0;
     var iter = ctx.window_map.iterator();
     while (iter.next()) |entry| {
-        if (count >= 1024) break;
+        if (count >= ids.len) break;
         const con = entry.value_ptr.*;
         const wd = con.window orelse continue;
         if (entry.key_ptr.* != wd.id) continue; // skip frame_id entries
@@ -666,6 +706,8 @@ const BatchedWindowProps = struct {
     window_type: []const u8 = "",
     window_role: []const u8 = "",
     should_float: bool = false,
+    min_w: u32 = 0,
+    min_h: u32 = 0,
 };
 
 /// Read all window properties in a single batched roundtrip.
@@ -680,6 +722,7 @@ fn readAllWindowPropertiesBatched(allocator: std.mem.Allocator, conn: *xcb.Conne
     const transient_cookie = xcb.getProperty(conn, 0, window, xcb.ATOM_WM_TRANSIENT_FOR, xcb.ATOM_WINDOW, 0, 1);
     const type_cookie = xcb.getProperty(conn, 0, window, atoms.net_wm_window_type, xcb.ATOM_ATOM, 0, 32);
     const role_cookie = xcb.getProperty(conn, 0, window, atoms.wm_window_role, xcb.ATOM_STRING, 0, 256);
+    const hints_cookie = xcb.getProperty(conn, 0, window, xcb.ATOM_WM_NORMAL_HINTS, xcb.ATOM_WM_NORMAL_HINTS, 0, 18);
 
     var props = BatchedWindowProps{};
 
@@ -799,6 +842,24 @@ fn readAllWindowPropertiesBatched(allocator: std.mem.Allocator, conn: *xcb.Conne
         }
     }
 
+    // 6. WM_NORMAL_HINTS — extract minimum size constraints
+    if (xcb.getPropertyReply(conn, hints_cookie, null)) |reply| {
+        defer std.c.free(reply);
+        const len = xcb.getPropertyValueLength(reply);
+        // WM_SIZE_HINTS: flags at offset 0, min_width at offset 5, min_height at offset 6 (u32 units)
+        if (len >= 7 * 4) {
+            if (xcb.getPropertyValue(reply)) |ptr| {
+                const vals: [*]const u32 = @ptrCast(@alignCast(ptr));
+                const flags = vals[0];
+                const PMinSize: u32 = (1 << 4); // ICCCM PMinSize flag
+                if (flags & PMinSize != 0) {
+                    props.min_w = vals[5];
+                    props.min_h = vals[6];
+                }
+            }
+        }
+    }
+
     return props;
 }
 
@@ -892,6 +953,8 @@ fn handleMapRequest(ctx: *EventContext, ev: *xcb.MapRequestEvent) void {
         .window_role = props.window_role,
         .transient_for = props.transient_for,
         .pending_unmap = 0, // Window is unmapped at MapRequest time; reparent of unmapped window does not generate UnmapNotify
+        .min_w = props.min_w,
+        .min_h = props.min_h,
     };
     con.is_floating = props.should_float;
     // Apply default border style from config
@@ -1668,7 +1731,49 @@ fn handleExpose(ctx: *EventContext, ev: *xcb.c.xcb_expose_event_t) void {
 
 // --- Command execution ---
 
+/// Collect containers matching criteria (max 64). Walks tree depth-first.
+fn collectMatchingContainers(root: *tree.Container, crit: *const criteria.Criteria, out: *[64]*tree.Container) usize {
+    var count: usize = 0;
+    collectMatchingRecursive(root, crit, out, &count);
+    return count;
+}
+
+fn collectMatchingRecursive(con: *tree.Container, crit: *const criteria.Criteria, out: *[64]*tree.Container, count: *usize) void {
+    if (count.* >= 64) return;
+    if (criteria.matches(crit, con)) {
+        out[count.*] = con;
+        count.* += 1;
+    }
+    var cur = con.children.first;
+    while (cur) |child| : (cur = child.next) {
+        collectMatchingRecursive(child, crit, out, count);
+    }
+}
+
 pub fn executeCommand(ctx: *EventContext, cmd: command_mod.Command) void {
+    // If command has criteria, execute on all matching containers instead of focused
+    if (cmd.criteria) |crit| {
+        var matches_buf: [64]*tree.Container = undefined;
+        const match_count = collectMatchingContainers(ctx.tree_root, &crit, &matches_buf);
+        if (match_count == 0) return;
+
+        // For each matching container, temporarily make it the focused container,
+        // execute the command, then restore focus. This matches i3 behavior.
+        const original_focused = getFocusedContainer(ctx.tree_root);
+        for (matches_buf[0..match_count]) |target| {
+            // Set temporary focus for the command execution
+            setFocus(ctx, target);
+            var cmd_no_crit = cmd;
+            cmd_no_crit.criteria = null;
+            executeCommand(ctx, cmd_no_crit);
+        }
+        // Restore original focus if it's still valid
+        if (original_focused) |orig| {
+            setFocus(ctx, orig);
+        }
+        return;
+    }
+
     switch (cmd.type) {
         .split => executeSplit(ctx, cmd),
         .focus => executeFocus(ctx, cmd),
@@ -2203,6 +2308,8 @@ fn executeExec(cmd: command_mod.Command) void {
 
 fn executeFloating(ctx: *EventContext) void {
     const focused = getFocusedContainer(ctx.tree_root) orelse return;
+    // Only windows and split_cons can float — workspaces/outputs/root cannot
+    if (focused.type != .window and focused.type != .split_con) return;
     focused.is_floating = !focused.is_floating;
     focused.markDirtyToWorkspace();
     relayoutAndRender(ctx);
@@ -2283,6 +2390,8 @@ fn executeBorder(ctx: *EventContext, cmd: command_mod.Command) void {
 
 fn executeFullscreen(ctx: *EventContext) void {
     const focused = getFocusedContainer(ctx.tree_root) orelse return;
+    // Only windows can be fullscreened
+    if (focused.type != .window) return;
     focused.is_fullscreen = if (focused.is_fullscreen != .none) .none else .window;
     focused.markDirtyToWorkspace();
 
@@ -2539,10 +2648,12 @@ fn executeMoveWorkspaceToOutput(ctx: *EventContext, cmd: command_mod.Command) vo
     target_out.appendChild(current_ws);
     current_ws.rect = target_out.rect;
 
-    // Update workspace output_name to match target output
+    // Update workspace output_name to match target output (must dupe to avoid aliased ownership)
     if (current_ws.workspace) |*wsd| {
-        if (target_out.workspace) |tout_wsd| {
-            wsd.output_name = tout_wsd.output_name;
+        if (target_out.output_data) |od| {
+            // Free old output_name before replacing (skip empty string literals)
+            if (wsd.output_name.len > 0) ctx.allocator.free(wsd.output_name);
+            wsd.output_name = ctx.allocator.dupe(u8, od.name) catch od.name;
         }
     }
 
