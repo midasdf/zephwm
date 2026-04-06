@@ -88,12 +88,12 @@ fn queryBarConfig(allocator: std.mem.Allocator, sock_path: []const u8) BarConfig
     const response = ipc.sendRequest(allocator, sock_path, .get_bar_config, "") orelse return cfg;
     defer allocator.free(response);
 
-    // Parse font
+    // Parse font (handles escaped quotes, then unescape)
     if (std.mem.indexOf(u8, response, "\"font\":\"")) |pos| {
         const start = pos + 8;
-        if (std.mem.indexOfScalar(u8, response[start..], '"')) |end| {
-            const len: u8 = @intCast(@min(end, 255));
-            @memcpy(cfg.font[0..len], response[start..][0..len]);
+        if (findUnescapedQuote(response[start..])) |end| {
+            const raw = response[start..][0..end];
+            const len: u8 = @intCast(unescapeJsonString(&cfg.font, raw));
             cfg.font_len = len;
         }
     }
@@ -108,12 +108,12 @@ fn queryBarConfig(allocator: std.mem.Allocator, sock_path: []const u8) BarConfig
         }
     }
 
-    // Parse status_command
+    // Parse status_command (handles escaped quotes, then unescape)
     if (std.mem.indexOf(u8, response, "\"status_command\":\"")) |pos| {
         const start = pos + 18;
-        if (std.mem.indexOfScalar(u8, response[start..], '"')) |end| {
-            const len: u16 = @intCast(@min(end, 511));
-            @memcpy(cfg.status_command[0..len], response[start..][0..len]);
+        if (findUnescapedQuote(response[start..])) |end| {
+            const raw = response[start..][0..end];
+            const len: u16 = @intCast(unescapeJsonString(&cfg.status_command, raw));
             cfg.status_command_len = len;
         }
     }
@@ -968,29 +968,24 @@ fn parseStatusUpdate(
         while (pos < inner.len and block_count.* < MAX_STATUS_BLOCKS) {
             // Find next block object
             const obj_start = std.mem.indexOfScalar(u8, inner[pos..], '{') orelse break;
-            const obj_end = std.mem.indexOfScalar(u8, inner[pos + obj_start..], '}') orelse break;
+            // Find matching '}' while skipping quoted strings
+            const obj_end = findMatchingBrace(inner[pos + obj_start ..]) orelse break;
             const obj = inner[pos + obj_start .. pos + obj_start + obj_end + 1];
 
             const idx = block_count.*;
             blocks[idx] = .{};
 
-            // Extract full_text
+            // Extract full_text (unescape JSON escapes)
             if (extractJsonString(obj, "\"full_text\":\"")) |ft| {
-                const copy_len = @min(ft.len, @as(usize, 256));
-                @memcpy(blocks[idx].full_text[0..copy_len], ft[0..copy_len]);
-                blocks[idx].full_text_len = @intCast(copy_len);
+                blocks[idx].full_text_len = @intCast(unescapeJsonString(&blocks[idx].full_text, ft));
             }
-            // Extract name
+            // Extract name (unescape JSON escapes)
             if (extractJsonString(obj, "\"name\":\"")) |nm| {
-                const copy_len = @min(nm.len, @as(usize, 64));
-                @memcpy(blocks[idx].name[0..copy_len], nm[0..copy_len]);
-                blocks[idx].name_len = @intCast(copy_len);
+                blocks[idx].name_len = @intCast(unescapeJsonString(&blocks[idx].name, nm));
             }
-            // Extract instance
+            // Extract instance (unescape JSON escapes)
             if (extractJsonString(obj, "\"instance\":\"")) |inst| {
-                const copy_len = @min(inst.len, @as(usize, 64));
-                @memcpy(blocks[idx].instance[0..copy_len], inst[0..copy_len]);
-                blocks[idx].instance_len = @intCast(copy_len);
+                blocks[idx].instance_len = @intCast(unescapeJsonString(&blocks[idx].instance, inst));
             }
 
             block_count.* += 1;
@@ -1020,9 +1015,94 @@ fn jsonEscapeWrite(w: anytype, s: []const u8) !void {
     }
 }
 
+/// Find the position of the matching '}' for a '{' at s[0], skipping quoted strings.
+fn findMatchingBrace(s: []const u8) ?usize {
+    if (s.len == 0 or s[0] != '{') return null;
+    var depth: usize = 0;
+    var in_string = false;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (in_string) {
+            if (s[i] == '\\') {
+                i += 1; // skip escaped character
+                continue;
+            }
+            if (s[i] == '"') in_string = false;
+            continue;
+        }
+        switch (s[i]) {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Find position of next unescaped double-quote in a string.
+/// Skips over backslash-escaped characters (e.g. \").
+fn findUnescapedQuote(s: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\') {
+            i += 1; // skip escaped character
+            continue;
+        }
+        if (s[i] == '"') return i;
+    }
+    return null;
+}
+
 fn extractJsonString(json: []const u8, key: []const u8) ?[]const u8 {
     const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
     const val_start = key_pos + key.len;
-    const val_end = std.mem.indexOfScalar(u8, json[val_start..], '"') orelse return null;
-    return json[val_start .. val_start + val_end];
+    // Scan for unescaped closing quote (skip \" sequences)
+    var i: usize = 0;
+    while (i < json[val_start..].len) : (i += 1) {
+        if (json[val_start + i] == '\\') {
+            i += 1; // skip escaped character
+            continue;
+        }
+        if (json[val_start + i] == '"') {
+            return json[val_start .. val_start + i];
+        }
+    }
+    return null;
+}
+
+/// Unescape JSON string escape sequences in-place into a destination buffer.
+/// Handles: \" \\ \/ \b \f \n \r \t. Returns the unescaped length.
+fn unescapeJsonString(dst: []u8, src: []const u8) usize {
+    var si: usize = 0;
+    var di: usize = 0;
+    while (si < src.len and di < dst.len) {
+        if (src[si] == '\\' and si + 1 < src.len) {
+            const next = src[si + 1];
+            const replacement: ?u8 = switch (next) {
+                '"' => '"',
+                '\\' => '\\',
+                '/' => '/',
+                'b' => 0x08,
+                'f' => 0x0C,
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                else => null,
+            };
+            if (replacement) |ch| {
+                dst[di] = ch;
+                di += 1;
+                si += 2;
+                continue;
+            }
+        }
+        dst[di] = src[si];
+        di += 1;
+        si += 1;
+    }
+    return di;
 }

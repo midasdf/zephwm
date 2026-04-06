@@ -3,7 +3,7 @@ const log = std.log.scoped(.layout);
 const tree = @import("tree.zig");
 const render = @import("render.zig");
 
-const MAX_TILING_CHILDREN: usize = 64;
+const MAX_TILING_CHILDREN: usize = 256;
 
 /// Apply layout to a container's children. Recursively descends into split_con children.
 /// gap: pixel gap between windows

@@ -46,10 +46,8 @@ pub fn detectOutputs(
             };
             // Store output name in workspace data (reusing WorkspaceData for output_name)
             const name = try allocator.dupe(u8, info.nameSlice());
-            const out_name = try allocator.dupe(u8, info.nameSlice());
-            output_con.workspace = tree.WorkspaceData{
+            output_con.output_data = tree.OutputData{
                 .name = name,
-                .output_name = out_name,
             };
             tree_root.appendChild(output_con);
 
@@ -74,10 +72,8 @@ pub fn detectOutputs(
             .h = screen.height_in_pixels,
         };
         const name = try allocator.dupe(u8, "default");
-        const out_name = try allocator.dupe(u8, "default");
-        output_con.workspace = tree.WorkspaceData{
+        output_con.output_data = tree.OutputData{
             .name = name,
-            .output_name = out_name,
         };
         tree_root.appendChild(output_con);
 
@@ -216,7 +212,7 @@ pub fn updateOutputs(
         out_cur = tree_root.children.first;
         while (out_cur) |out_con| : (out_cur = out_con.next) {
             if (out_con.type != .output) continue;
-            const out_name = if (out_con.workspace) |wsd| wsd.output_name else "";
+            const out_name = if (out_con.output_data) |od| od.name else "";
             if (std.mem.eql(u8, out_name, name)) {
                 // Update geometry
                 out_con.rect = .{ .x = info.x, .y = info.y, .w = info.w, .h = info.h };
@@ -236,10 +232,8 @@ pub fn updateOutputs(
             const output_con = try tree.Container.create(allocator, .output);
             output_con.rect = .{ .x = info.x, .y = info.y, .w = info.w, .h = info.h };
             const owned_name = try allocator.dupe(u8, name);
-            const owned_out_name = try allocator.dupe(u8, name);
-            output_con.workspace = tree.WorkspaceData{
+            output_con.output_data = tree.OutputData{
                 .name = owned_name,
-                .output_name = owned_out_name,
             };
             output_con.dirty = false;
             tree_root.appendChild(output_con);
@@ -277,7 +271,7 @@ pub fn updateOutputs(
     while (out_cur) |out_con| {
         const next = out_con.next;
         if (out_con.type == .output and out_con.dirty) {
-            const out_name = if (out_con.workspace) |wsd| wsd.output_name else "?";
+            const out_name = if (out_con.output_data) |od| od.name else "?";
             std.debug.print("zephwm: output removed: {s}\n", .{out_name});
 
             // Move all workspaces to first_output
@@ -315,7 +309,7 @@ pub fn findByName(root: *tree.Container, name: []const u8) ?*tree.Container {
     var cur = root.children.first;
     while (cur) |child| : (cur = child.next) {
         if (child.type != .output) continue;
-        const out_name = if (child.workspace) |wsd| wsd.output_name else "";
+        const out_name = if (child.output_data) |od| od.name else "";
         if (std.mem.eql(u8, out_name, name)) return child;
     }
     return null;

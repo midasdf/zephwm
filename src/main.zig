@@ -158,8 +158,8 @@ fn handleIpcMessage(ctx: *event.EventContext, client_fd: std.posix.fd_t, msg_typ
         @intFromEnum(ipc.MessageType.get_tree) => buildTreeJson(ctx, &dyn_buf),
         @intFromEnum(ipc.MessageType.get_marks) => buildMarksJson(ctx, &dyn_buf),
         @intFromEnum(ipc.MessageType.get_bar_config) => buildBarConfigJson(ctx, &dyn_buf),
-        @intFromEnum(ipc.MessageType.get_config) => "{}",
-        @intFromEnum(ipc.MessageType.get_binding_modes) => "[\"default\"]",
+        @intFromEnum(ipc.MessageType.get_config) => buildConfigJson(ctx, &dyn_buf),
+        @intFromEnum(ipc.MessageType.get_binding_modes) => buildBindingModesJson(ctx, &dyn_buf),
         @intFromEnum(ipc.MessageType.subscribe) => blk: {
             // Parse subscription payload and register client
             registerSubscription(client_fd, payload, ctx.ipc_sub_fds, ctx.ipc_sub_masks);
@@ -222,8 +222,8 @@ fn buildWorkspacesJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
             const ws_output_name = blk: {
                 if (ws.parent) |parent| {
                     if (parent.type == .output) {
-                        if (parent.workspace) |parent_wsd| {
-                            if (parent_wsd.output_name.len > 0) break :blk parent_wsd.output_name;
+                        if (parent.output_data) |od| {
+                            if (od.name.len > 0) break :blk od.name;
                         }
                     }
                 }
@@ -279,13 +279,14 @@ fn buildOutputsJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
         }
 
         // Output name: use stored name if available, else "default"
-        const out_name = if (out_con.workspace) |wsd| wsd.output_name else "default";
+        const out_name = if (out_con.output_data) |od| od.name else "default";
         const display_name = if (out_name.len > 0) out_name else "default";
 
+        w.writeAll("{\"name\":\"") catch return "[]";
+        jsonEscapeWrite(w, display_name) catch return "[]";
         std.fmt.format(w,
-            "{{\"name\":\"{s}\",\"active\":true,\"primary\":{},\"rect\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}}},\"current_workspace\":\"",
+            "\",\"active\":true,\"primary\":{},\"rect\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}}},\"current_workspace\":\"",
             .{
-                display_name,
                 is_primary,
                 out_con.rect.x,
                 out_con.rect.y,
@@ -294,7 +295,7 @@ fn buildOutputsJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
             },
         ) catch return "[]";
         jsonEscapeWrite(w, ws_name) catch return "[]";
-        w.writeAll("\"}}") catch return "[]";
+        w.writeAll("\"}") catch return "[]";
         is_primary = false;
     }
 
@@ -336,6 +337,71 @@ fn buildBarConfigJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
     w.writeAll("\",\"focused_workspace_text\":\"") catch return "{}";
     jsonEscapeWrite(w, cfg.focused_text) catch return "{}";
     w.writeAll("\"}}") catch return "{}";
+    return fbs.getWritten();
+}
+
+fn buildConfigJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
+    _ = ctx;
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    // i3 GET_CONFIG returns file contents in the "config" field
+    w.writeAll("{\"config\":\"") catch return "{}";
+
+    // Search same paths as loadConfig
+    const home = std.posix.getenv("HOME") orelse "";
+    const xdg_config = std.posix.getenv("XDG_CONFIG_HOME");
+    var path_buf: [512]u8 = undefined;
+    const config_path: []const u8 = blk: {
+        if (xdg_config) |xdg| {
+            const len = (std.fmt.bufPrint(&path_buf, "{s}/zephwm/config", .{xdg}) catch break :blk "").len;
+            if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+        }
+        {
+            const len = (std.fmt.bufPrint(&path_buf, "{s}/.config/zephwm/config", .{home}) catch break :blk "").len;
+            if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+        }
+        {
+            const len = (std.fmt.bufPrint(&path_buf, "{s}/.zephwm/config", .{home}) catch break :blk "").len;
+            if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+        }
+        if (std.fs.cwd().access("/etc/zephwm/config", .{})) |_| {
+            const etc = "/etc/zephwm/config";
+            @memcpy(path_buf[0..etc.len], etc);
+            break :blk path_buf[0..etc.len];
+        } else |_| {}
+        break :blk "";
+    };
+
+    // Read and emit file contents (not the path)
+    if (config_path.len > 0) {
+        if (std.fs.cwd().openFile(config_path, .{})) |file| {
+            defer file.close();
+            var read_buf: [4096]u8 = undefined;
+            while (true) {
+                const n = file.read(&read_buf) catch break;
+                if (n == 0) break;
+                jsonEscapeWrite(w, read_buf[0..n]) catch return "{}";
+            }
+        } else |_| {}
+    }
+    w.writeAll("\"}") catch return "{}";
+    return fbs.getWritten();
+}
+
+fn buildBindingModesJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    w.writeAll("[\"default\"") catch return "[\"default\"]";
+    // Add any extra modes defined in config
+    if (ctx.config) |cfg| {
+        var mode_iter = cfg.modes.keyIterator();
+        while (mode_iter.next()) |key| {
+            w.writeAll(",\"") catch return "[\"default\"]";
+            jsonEscapeWrite(w, key.*) catch return "[\"default\"]";
+            w.writeByte('"') catch return "[\"default\"]";
+        }
+    }
+    w.writeByte(']') catch return "[\"default\"]";
     return fbs.getWritten();
 }
 
@@ -402,7 +468,9 @@ fn writeContainerJson(w: anytype, con: *tree.Container) !void {
 
     // name
     if (con.workspace) |wsd| {
-        try std.fmt.format(w, ",\"name\":\"{s}\"", .{wsd.name});
+        try w.writeAll(",\"name\":\"");
+        try jsonEscapeWrite(w, wsd.name);
+        try w.writeAll("\"");
     } else if (con.window) |wd| {
         try w.writeAll(",\"name\":\"");
         try jsonEscapeWrite(w, wd.title);
@@ -438,7 +506,11 @@ fn writeContainerJson(w: anytype, con: *tree.Container) !void {
     if (con.window) |wd| {
         try std.fmt.format(w, ",\"window\":{d}", .{wd.id});
         if (wd.class.len > 0) {
-            try std.fmt.format(w, ",\"window_properties\":{{\"class\":\"{s}\",\"instance\":\"{s}\"}}", .{ wd.class, wd.instance });
+            try w.writeAll(",\"window_properties\":{\"class\":\"");
+            try jsonEscapeWrite(w, wd.class);
+            try w.writeAll("\",\"instance\":\"");
+            try jsonEscapeWrite(w, wd.instance);
+            try w.writeAll("\"}");
         }
     }
 

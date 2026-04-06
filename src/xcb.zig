@@ -120,6 +120,7 @@ pub const ATOM_WM_CLASS: Atom = c.XCB_ATOM_WM_CLASS;
 pub const ATOM_WM_TRANSIENT_FOR: Atom = c.XCB_ATOM_WM_TRANSIENT_FOR;
 pub const ATOM_WM_HINTS: Atom = c.XCB_ATOM_WM_HINTS;
 pub const ATOM_WM_NORMAL_HINTS: Atom = c.XCB_ATOM_WM_NORMAL_HINTS;
+pub const ATOM_WM_SIZE_HINTS: Atom = c.XCB_ATOM_WM_SIZE_HINTS;
 
 // Input focus
 pub const INPUT_FOCUS_POINTER_ROOT: u8 = c.XCB_INPUT_FOCUS_POINTER_ROOT;
@@ -371,10 +372,12 @@ pub const KeyMap = struct {
 
     fn keysymData(self: *const KeyMap) []const Keysym {
         const total: usize = @as(usize, self.max_keycode - self.min_keycode + 1) * self.keysyms_per_keycode;
-        const ptr: [*]const Keysym = @ptrCast(@alignCast(
-            @as([*]const u8, @ptrCast(self.reply)) + @sizeOf(c.xcb_get_keyboard_mapping_reply_t),
-        ));
-        return ptr[0..total];
+        if (total == 0) return &.{};
+        // Use the XCB protocol accessor (ABI-safe, no manual pointer arithmetic)
+        const xcb_len: usize = @intCast(c.xcb_get_keyboard_mapping_keysyms_length(self.reply));
+        const safe_total = @min(total, xcb_len);
+        const ptr: [*]const Keysym = @ptrCast(c.xcb_get_keyboard_mapping_keysyms(self.reply));
+        return ptr[0..safe_total];
     }
 
     pub fn getKeysym(self: *const KeyMap, keycode: Keycode, col: u8) Keysym {
@@ -389,12 +392,14 @@ pub const KeyMap = struct {
     /// Find the first keycode that produces the given keysym (any column).
     pub fn getKeycode(self: *const KeyMap, keysym: Keysym) ?Keycode {
         const data = self.keysymData();
+        if (data.len == 0) return null;
         var kc: usize = 0;
         const count: usize = @as(usize, self.max_keycode - self.min_keycode) + 1;
         while (kc < count) : (kc += 1) {
             const base = kc * self.keysyms_per_keycode;
             var col: usize = 0;
             while (col < self.keysyms_per_keycode) : (col += 1) {
+                if (base + col >= data.len) break;
                 if (data[base + col] == keysym) {
                     return @intCast(kc + self.min_keycode);
                 }

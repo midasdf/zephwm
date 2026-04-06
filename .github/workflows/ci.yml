@@ -28,7 +28,7 @@ jobs:
 
       - name: Format check
         continue-on-error: true
-        run: zig fmt --check src/
+        run: zig fmt --check src/ zephwm-bar/
 
       - name: Build
         run: zig build

@@ -133,7 +133,9 @@ pub fn acceptClient(listen_fd: std.posix.fd_t) !std.posix.fd_t {
 
 /// Read a complete message from client fd into buf.
 /// Returns msg_type + payload slice, or null if EOF/disconnect.
-/// Returns error.WouldBlock if no data available yet (EAGAIN).
+/// Returns error.WouldBlock if no data available yet (EAGAIN) AND no bytes have been read.
+/// If partial data was consumed and WouldBlock occurs, returns null (disconnect) to avoid
+/// busy-looping on the single-threaded event loop.
 pub fn readMessage(fd: std.posix.fd_t, buf: []u8) error{WouldBlock}!?struct { msg_type: u32, payload: []const u8 } {
     if (buf.len < HEADER_SIZE) return null;
 
@@ -141,7 +143,10 @@ pub fn readMessage(fd: std.posix.fd_t, buf: []u8) error{WouldBlock}!?struct { ms
     var total_read: usize = 0;
     while (total_read < HEADER_SIZE) {
         const n = std.posix.read(fd, buf[total_read..]) catch |err| {
-            if (err == error.WouldBlock) return error.WouldBlock;
+            if (err == error.WouldBlock) {
+                if (total_read == 0) return error.WouldBlock;
+                return null; // Partial header + WouldBlock: drop client to avoid busy-loop
+            }
             return null;
         };
         if (n == 0) return null; // EOF
@@ -155,10 +160,10 @@ pub fn readMessage(fd: std.posix.fd_t, buf: []u8) error{WouldBlock}!?struct { ms
     const total_needed = HEADER_SIZE + payload_len;
     if (buf.len < total_needed) return null;
 
-    // Read payload
+    // Read payload — once header is read, we must complete the message
     while (total_read < total_needed) {
         const n = std.posix.read(fd, buf[total_read..total_needed]) catch |err| {
-            if (err == error.WouldBlock) return error.WouldBlock;
+            if (err == error.WouldBlock) return null; // Partial payload: drop client to avoid busy-loop
             return null;
         };
         if (n == 0) return null;
@@ -203,10 +208,10 @@ pub fn sendRequest(allocator: std.mem.Allocator, sock_path: []const u8, msg_type
     const fd = connectToServer(sock_path) catch return null;
     defer std.posix.close(fd);
 
-    // Send
+    // Send (use writeAll to handle partial writes correctly)
     var send_buf: [4096 + HEADER_SIZE]u8 = undefined;
     const msg = encode(msg_type, payload, &send_buf);
-    _ = std.posix.write(fd, msg) catch return null;
+    writeAll(fd, msg) catch return null;
 
     // Read response
     var recv_buf: [65536]u8 = undefined;
