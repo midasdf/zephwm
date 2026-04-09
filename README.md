@@ -279,3 +279,6 @@ No GLib, pango, cairo, or other heavy dependencies. Linux only (uses epoll and s
 ## License
 
 [MIT](LICENSE)
+
+## Disclaimer
+This project uses AI-generated code (LLM). I do my best to review and test it, but I can't guarantee it's perfect. Please use it at your own risk.\n
