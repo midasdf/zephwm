@@ -111,7 +111,7 @@ zephwm/
 
 ## Building
 
-Requires **Zig 0.15.0+** and the following system libraries:
+Requires **Zig 0.16.0+** and the following system libraries:
 
 ```
 xcb xcb-randr
