@@ -9,10 +9,19 @@ pub fn build(b: *std.Build) void {
     const single_threaded: ?bool = if (optimize != .Debug) true else null;
 
     // Shared modules
+    const posix_compat_mod = b.createModule(.{
+        .root_source_file = b.path("src/posix_compat.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
     const ipc_mod = b.createModule(.{
         .root_source_file = b.path("src/ipc.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "posix_compat", .module = posix_compat_mod },
+        },
     });
 
     // Cross-compile library search path (aarch64 sysroot)
@@ -25,42 +34,81 @@ pub fn build(b: *std.Build) void {
     else
         null;
 
+    // --- TranslateC modules (replaces @cImport in 0.16) ---
+
+    // src/xcb.zig: xcb.h + xcb/randr.h
+    const xcb_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/xcb_cimport.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    if (sysroot_inc) |p| xcb_translate.addIncludePath(p);
+    const xcb_c_mod = xcb_translate.createModule();
+
+    // zephwm-bar/main.zig: xcb.h
+    const bar_xcb_translate = b.addTranslateC(.{
+        .root_source_file = b.path("zephwm-bar/xcb_cimport.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    if (sysroot_inc) |p| bar_xcb_translate.addIncludePath(p);
+    const bar_xcb_c_mod = bar_xcb_translate.createModule();
+
+    // zephwm-bar/builtin_status.zig: time.h
+    const bs_translate = b.addTranslateC(.{
+        .root_source_file = b.path("zephwm-bar/builtin_status_cimport.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    if (sysroot_inc) |p| bs_translate.addIncludePath(p);
+    const bs_c_mod = bs_translate.createModule();
+
     // --- zephwm (main WM) ---
+    const zephwm_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .imports = &.{
+            .{ .name = "c", .module = xcb_c_mod },
+            .{ .name = "posix_compat", .module = posix_compat_mod },
+        },
+    });
+    if (sysroot_lib) |p| zephwm_mod.addLibraryPath(p);
+    if (sysroot_inc) |p| zephwm_mod.addSystemIncludePath(p);
+    zephwm_mod.linkSystemLibrary("xcb", .{});
+    zephwm_mod.linkSystemLibrary("xcb-randr", .{});
+    zephwm_mod.link_libc = true;
     const zephwm_exe = b.addExecutable(.{
         .name = "zephwm",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .single_threaded = single_threaded,
-        }),
+        .root_module = zephwm_mod,
     });
-    if (sysroot_lib) |p| zephwm_exe.addLibraryPath(p);
-    if (sysroot_inc) |p| zephwm_exe.addSystemIncludePath(p);
-    zephwm_exe.linkSystemLibrary("xcb");
-    zephwm_exe.linkSystemLibrary("xcb-randr");
-    zephwm_exe.linkLibC();
     b.installArtifact(zephwm_exe);
 
     // --- zephwm-msg ---
+    const msg_mod = b.createModule(.{
+        .root_source_file = b.path("zephwm-msg/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .imports = &.{
+            .{ .name = "ipc", .module = ipc_mod },
+            .{ .name = "posix_compat", .module = posix_compat_mod },
+        },
+    });
+    if (sysroot_lib) |p| msg_mod.addLibraryPath(p);
+    if (sysroot_inc) |p| msg_mod.addSystemIncludePath(p);
+    msg_mod.linkSystemLibrary("xcb", .{});
+    msg_mod.link_libc = true;
     const msg_exe = b.addExecutable(.{
         .name = "zephwm-msg",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("zephwm-msg/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .single_threaded = single_threaded,
-            .imports = &.{
-                .{ .name = "ipc", .module = ipc_mod },
-            },
-        }),
+        .root_module = msg_mod,
     });
-    if (sysroot_lib) |p| msg_exe.addLibraryPath(p);
-    if (sysroot_inc) |p| msg_exe.addSystemIncludePath(p);
-    msg_exe.linkSystemLibrary("xcb");
-    msg_exe.linkLibC();
     b.installArtifact(msg_exe);
 
     // builtin_status module (needs libc for ioctl/localtime_r, X11 for IME property)
@@ -69,28 +117,35 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .link_libc = true,
+        .imports = &.{
+            .{ .name = "c", .module = bs_c_mod },
+            .{ .name = "posix_compat", .module = posix_compat_mod },
+        },
     });
     // builtin_status only needs libc (for localtime_r), no X11/xcb
 
     // --- zephwm-bar ---
+    const bar_mod = b.createModule(.{
+        .root_source_file = b.path("zephwm-bar/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = strip,
+        .single_threaded = single_threaded,
+        .imports = &.{
+            .{ .name = "ipc", .module = ipc_mod },
+            .{ .name = "builtin_status", .module = builtin_status_mod },
+            .{ .name = "c", .module = bar_xcb_c_mod },
+            .{ .name = "posix_compat", .module = posix_compat_mod },
+        },
+    });
+    if (sysroot_lib) |p| bar_mod.addLibraryPath(p);
+    if (sysroot_inc) |p| bar_mod.addSystemIncludePath(p);
+    bar_mod.linkSystemLibrary("xcb", .{});
+    bar_mod.link_libc = true;
     const bar_exe = b.addExecutable(.{
         .name = "zephwm-bar",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("zephwm-bar/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .strip = strip,
-            .single_threaded = single_threaded,
-            .imports = &.{
-                .{ .name = "ipc", .module = ipc_mod },
-                .{ .name = "builtin_status", .module = builtin_status_mod },
-            },
-        }),
+        .root_module = bar_mod,
     });
-    if (sysroot_lib) |p| bar_exe.addLibraryPath(p);
-    if (sysroot_inc) |p| bar_exe.addSystemIncludePath(p);
-    bar_exe.linkSystemLibrary("xcb");
-    bar_exe.linkLibC();
     b.installArtifact(bar_exe);
 
     // Shared tree module (pure Zig, no xcb dependency)

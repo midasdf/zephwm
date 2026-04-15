@@ -1,6 +1,7 @@
 // IPC module — shared between zephwm, zephwm-msg, and zephwm-bar
 // i3-compatible binary IPC protocol
 const std = @import("std");
+pub const posix_compat = @import("posix_compat");
 
 pub const MAGIC = "i3-ipc";
 pub const HEADER_SIZE = 14; // 6 (magic) + 4 (payload_len) + 4 (msg_type)
@@ -94,22 +95,22 @@ pub fn createServer(socket_path: []const u8) !std.posix.fd_t {
     // Create parent directory
     if (std.mem.lastIndexOfScalar(u8, socket_path, '/')) |sep| {
         const dir_path = socket_path[0..sep];
-        std.posix.mkdirat(std.posix.AT.FDCWD, dir_path, 0o700) catch |e| switch (e) {
+        posix_compat.mkdirat(std.posix.AT.FDCWD, dir_path, 0o700) catch |e| switch (e) {
             error.PathAlreadyExists => {},
             else => return e,
         };
     }
 
     // Delete stale socket file
-    std.posix.unlinkat(std.posix.AT.FDCWD, socket_path, 0) catch {};
+    posix_compat.unlinkat(std.posix.AT.FDCWD, socket_path, 0) catch {};
 
     // Create socket
-    const fd = try std.posix.socket(
+    const fd = try posix_compat.socket(
         std.posix.AF.UNIX,
         std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
         0,
     );
-    errdefer std.posix.close(fd);
+    errdefer posix_compat.close(fd);
 
     // Bind
     var addr: std.posix.sockaddr.un = .{ .path = undefined };
@@ -118,17 +119,17 @@ pub fn createServer(socket_path: []const u8) !std.posix.fd_t {
     if (socket_path.len > addr.path.len) return error.NameTooLong;
     @memcpy(addr.path[0..socket_path.len], socket_path);
 
-    try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+    try posix_compat.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
 
     // Listen
-    try std.posix.listen(fd, 5);
+    try posix_compat.listen(fd, 5);
 
     return fd;
 }
 
 /// Accept a client connection (non-blocking).
 pub fn acceptClient(listen_fd: std.posix.fd_t) !std.posix.fd_t {
-    return try std.posix.accept(listen_fd, null, null, std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC);
+    return try posix_compat.accept(listen_fd, null, null, std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC);
 }
 
 /// Read a complete message from client fd into buf.
@@ -180,7 +181,7 @@ pub fn readMessage(fd: std.posix.fd_t, buf: []u8) error{WouldBlock}!?struct { ms
 fn writeAll(fd: std.posix.fd_t, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
-        const n = try std.posix.write(fd, data[written..]);
+        const n = try posix_compat.write(fd, data[written..]);
         if (n == 0) return error.BrokenPipe;
         written += n;
     }
@@ -196,17 +197,17 @@ pub fn connectToServer(sock_path: []const u8) !std.posix.fd_t {
     if (sock_path.len > addr.path.len) return error.NameTooLong;
     @memcpy(addr.path[0..sock_path.len], sock_path);
 
-    const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    errdefer std.posix.close(fd);
+    const fd = try posix_compat.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    errdefer posix_compat.close(fd);
 
-    try std.posix.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+    try posix_compat.connect(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
     return fd;
 }
 
 /// Send a request and read the full response. Caller owns returned slice.
 pub fn sendRequest(allocator: std.mem.Allocator, sock_path: []const u8, msg_type: MessageType, payload: []const u8) ?[]u8 {
     const fd = connectToServer(sock_path) catch return null;
-    defer std.posix.close(fd);
+    defer posix_compat.close(fd);
 
     // Send (use writeAll to handle partial writes correctly)
     var send_buf: [4096 + HEADER_SIZE]u8 = undefined;

@@ -1,10 +1,7 @@
 // XCB C bindings — thin wrapper around libxcb
 const std = @import("std");
 
-pub const c = @cImport({
-    @cInclude("xcb/xcb.h");
-    @cInclude("xcb/randr.h");
-});
+pub const c = @import("c");
 
 // --- Core types ---
 pub const Connection = c.xcb_connection_t;
@@ -484,9 +481,14 @@ pub fn randrGetOutputInfoName(reply: *RandrGetOutputInfoReply) []const u8 {
     return data[0..len];
 }
 
+// Workaround for Zig 0.16 translate-c bug: xcb_randr_id is declared as an
+// opaque struct in randr.h, which translate-c rejects with
+// "local variable has opaque type". Declare it manually instead.
+extern const xcb_randr_id: c.xcb_extension_t;
+
 /// Query RandR extension base event number. Returns 0 on failure.
 pub fn randrQueryExtension(conn: *Connection) u8 {
-    const reply = c.xcb_get_extension_data(conn, &c.xcb_randr_id);
+    const reply = c.xcb_get_extension_data(conn, @constCast(&xcb_randr_id));
     if (reply) |r| {
         if (r.*.present != 0) return r.*.first_event;
     }

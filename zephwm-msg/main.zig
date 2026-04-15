@@ -49,23 +49,21 @@ fn discoverSocket(override: ?[]const u8) ?[]const u8 {
     if (override) |path| return path;
 
     // Check I3SOCK env var
-    const env = std.posix.getenv("I3SOCK");
-    if (env) |path| return path;
+    const env_ptr = std.c.getenv("I3SOCK");
+    if (env_ptr) |p| return std.mem.span(p);
 
     return null;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
-    var args = std.process.args();
+    var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next(); // skip argv[0]
 
     var msg_type: ipc.MessageType = .run_command;
     var socket_override: ?[]const u8 = null;
-    var payload_parts = std.ArrayListUnmanaged([]const u8){};
+    var payload_parts: std.ArrayListUnmanaged([]const u8) = .empty;
     defer payload_parts.deinit(allocator);
 
     // Parse args
@@ -129,6 +127,6 @@ pub fn main() !void {
     defer allocator.free(response);
 
     // Print response payload to stdout
-    _ = std.posix.write(std.posix.STDOUT_FILENO, response) catch {};
-    _ = std.posix.write(std.posix.STDOUT_FILENO, "\n") catch {};
+    _ = ipc.posix_compat.write(std.posix.STDOUT_FILENO, response) catch {};
+    _ = ipc.posix_compat.write(std.posix.STDOUT_FILENO, "\n") catch {};
 }

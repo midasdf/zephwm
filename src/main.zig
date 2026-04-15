@@ -7,6 +7,7 @@ const output = @import("output.zig");
 const event = @import("event.zig");
 const render = @import("render.zig");
 const ipc = @import("ipc.zig");
+const posix_compat = @import("posix_compat");
 const config_mod = @import("config.zig");
 const command_mod = @import("command.zig");
 const bar = @import("bar.zig");
@@ -15,6 +16,12 @@ const linux = std.os.linux;
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 const VERSION = "0.1.0";
+
+/// Zig 0.16: std.posix.getenv was removed. Use libc getenv via std.c.
+fn getenv(name: [:0]const u8) ?[]const u8 {
+    const ptr = std.c.getenv(name.ptr) orelse return null;
+    return std.mem.span(ptr);
+}
 
 /// Write a JSON-escaped string to writer.
 fn jsonEscapeWrite(w: anytype, s: []const u8) !void {
@@ -194,8 +201,8 @@ fn isVisibleWorkspace(ws: *tree.Container, output_con: *tree.Container) bool {
 }
 
 fn buildWorkspacesJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var fbs = std.Io.Writer.fixed(buf);
+    const w = &fbs;
     w.writeByte('[') catch return "[]";
 
     var first = true;
@@ -216,7 +223,7 @@ fn buildWorkspacesJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
             // Check urgency from workspace data (set by urgency propagation)
             const urgent = if (ws.workspace) |wsd| wsd.urgent else false;
 
-            std.fmt.format(w, "{{\"num\":{d},\"name\":\"", .{num}) catch return "[]";
+            w.print("{{\"num\":{d},\"name\":\"", .{num}) catch return "[]";
             jsonEscapeWrite(w, name) catch return "[]";
             // Get output name from parent output container
             const ws_output_name = blk: {
@@ -230,9 +237,9 @@ fn buildWorkspacesJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
                 break :blk "default";
             };
             w.writeAll("\",\"visible\":") catch return "[]";
-            std.fmt.format(w, "{},\"focused\":{},\"output\":\"", .{ visible, focused }) catch return "[]";
+            w.print("{},\"focused\":{},\"output\":\"", .{ visible, focused }) catch return "[]";
             jsonEscapeWrite(w, ws_output_name) catch return "[]";
-            std.fmt.format(w, "\",\"urgent\":{},\"rect\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}}}}}", .{
+            w.print("\",\"urgent\":{},\"rect\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}}}}}", .{
                 urgent,
                 ws.rect.x,
                 ws.rect.y,
@@ -243,13 +250,13 @@ fn buildWorkspacesJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
     }
 
     w.writeByte(']') catch return "[]";
-    return fbs.getWritten();
+    return fbs.buffered();
 }
 
 /// Build JSON for GET_OUTPUTS response.
 fn buildOutputsJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var fbs = std.Io.Writer.fixed(buf);
+    const w = &fbs;
     w.writeByte('[') catch return "[]";
 
     var first = true;
@@ -284,7 +291,7 @@ fn buildOutputsJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
 
         w.writeAll("{\"name\":\"") catch return "[]";
         jsonEscapeWrite(w, display_name) catch return "[]";
-        std.fmt.format(w,
+        w.print(
             "\",\"active\":true,\"primary\":{},\"rect\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}}},\"current_workspace\":\"",
             .{
                 is_primary,
@@ -301,24 +308,24 @@ fn buildOutputsJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
 
     // If no outputs in tree, return a single default entry using actual screen size
     if (first) {
-        var fallback_fbs = std.io.fixedBufferStream(buf);
-        const fw = fallback_fbs.writer();
+        var fallback_fbs = std.Io.Writer.fixed(buf);
+        const fw = &fallback_fbs;
         fw.print("[{{\"name\":\"default\",\"active\":true,\"primary\":true," ++
             "\"rect\":{{\"x\":0,\"y\":0,\"width\":{d},\"height\":{d}}}," ++
             "\"current_workspace\":\"1\"}}]", .{ ctx.screen_width, ctx.screen_height }) catch return "[]";
-        return fallback_fbs.getWritten();
+        return fallback_fbs.buffered();
     }
 
     w.writeByte(']') catch return "[]";
-    return fbs.getWritten();
+    return fbs.buffered();
 }
 
 /// Build JSON for GET_MARKS response.
 /// Walks the entire tree collecting all marks from all containers.
 fn buildBarConfigJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
     const cfg = ctx.config orelse return "{}";
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var fbs = std.Io.Writer.fixed(buf);
+    const w = &fbs;
     w.writeAll("{\"id\":\"bar-0\",\"mode\":\"dock\",\"position\":\"") catch return "{}";
     jsonEscapeWrite(w, cfg.bar.position) catch return "{}";
     w.writeAll("\",\"status_command\":\"") catch return "{}";
@@ -337,44 +344,44 @@ fn buildBarConfigJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
     w.writeAll("\",\"focused_workspace_text\":\"") catch return "{}";
     jsonEscapeWrite(w, cfg.focused_text) catch return "{}";
     w.writeAll("\"}}") catch return "{}";
-    return fbs.getWritten();
+    return fbs.buffered();
 }
 
 fn buildConfigJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
     _ = ctx;
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var fbs = std.Io.Writer.fixed(buf);
+    const w = &fbs;
     // i3 GET_CONFIG returns file contents in the "config" field
     w.writeAll("{\"config\":\"") catch return "{}";
 
     // Search same paths as loadConfig
-    const home = std.posix.getenv("HOME") orelse "";
-    const xdg_config = std.posix.getenv("XDG_CONFIG_HOME");
+    const home = getenv("HOME") orelse "";
+    const xdg_config = getenv("XDG_CONFIG_HOME");
     var path_buf: [512]u8 = undefined;
     const config_path: []const u8 = blk: {
         if (xdg_config) |xdg| {
-            const len = (std.fmt.bufPrint(&path_buf, "{s}/zephwm/config", .{xdg}) catch break :blk "").len;
-            if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+            const len = (std.fmt.bufPrint(&path_buf, "{s}/zephwm/config", .{xdg}) catch break :blk @as([]u8, &[_]u8{})).len;
+            if (posix_compat.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
         }
         {
-            const len = (std.fmt.bufPrint(&path_buf, "{s}/.config/zephwm/config", .{home}) catch break :blk "").len;
-            if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+            const len = (std.fmt.bufPrint(&path_buf, "{s}/.config/zephwm/config", .{home}) catch break :blk @as([]u8, &[_]u8{})).len;
+            if (posix_compat.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
         }
         {
-            const len = (std.fmt.bufPrint(&path_buf, "{s}/.zephwm/config", .{home}) catch break :blk "").len;
-            if (std.fs.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
+            const len = (std.fmt.bufPrint(&path_buf, "{s}/.zephwm/config", .{home}) catch break :blk @as([]u8, &[_]u8{})).len;
+            if (posix_compat.cwd().access(path_buf[0..len], .{})) |_| break :blk path_buf[0..len] else |_| {}
         }
-        if (std.fs.cwd().access("/etc/zephwm/config", .{})) |_| {
+        if (posix_compat.cwd().access("/etc/zephwm/config", .{})) |_| {
             const etc = "/etc/zephwm/config";
             @memcpy(path_buf[0..etc.len], etc);
             break :blk path_buf[0..etc.len];
         } else |_| {}
-        break :blk "";
+        break :blk @as([]const u8, &[_]u8{});
     };
 
     // Read and emit file contents (not the path)
     if (config_path.len > 0) {
-        if (std.fs.cwd().openFile(config_path, .{})) |file| {
+        if (posix_compat.cwd().openFile(config_path, .{})) |file| {
             defer file.close();
             var read_buf: [4096]u8 = undefined;
             while (true) {
@@ -385,12 +392,12 @@ fn buildConfigJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
         } else |_| {}
     }
     w.writeAll("\"}") catch return "{}";
-    return fbs.getWritten();
+    return fbs.buffered();
 }
 
 fn buildBindingModesJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var fbs = std.Io.Writer.fixed(buf);
+    const w = &fbs;
     w.writeAll("[\"default\"") catch return "[\"default\"]";
     // Add any extra modes defined in config
     if (ctx.config) |cfg| {
@@ -402,19 +409,19 @@ fn buildBindingModesJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
         }
     }
     w.writeByte(']') catch return "[\"default\"]";
-    return fbs.getWritten();
+    return fbs.buffered();
 }
 
 fn buildMarksJson(ctx: *event.EventContext, buf: *[8192]u8) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var fbs = std.Io.Writer.fixed(buf);
+    const w = &fbs;
     w.writeByte('[') catch return "[]";
 
     var first = true;
     collectMarksRecursive(ctx.tree_root, w, &first) catch return "[]";
 
     w.writeByte(']') catch return "[]";
-    return fbs.getWritten();
+    return fbs.buffered();
 }
 
 fn collectMarksRecursive(con: *tree.Container, w: anytype, first: *bool) !void {
@@ -444,7 +451,12 @@ var tree_json_buf: std.ArrayListUnmanaged(u8) = .empty;
 
 fn buildTreeJson(ctx: *event.EventContext, _: *[8192]u8) []const u8 {
     tree_json_buf.clearRetainingCapacity();
-    writeContainerJson(tree_json_buf.writer(ctx.allocator), ctx.tree_root) catch return "{}";
+    var aw = std.Io.Writer.Allocating.fromArrayList(ctx.allocator, &tree_json_buf);
+    writeContainerJson(&aw.writer, ctx.tree_root) catch {
+        tree_json_buf = aw.toArrayList();
+        return "{}";
+    };
+    tree_json_buf = aw.toArrayList();
     return tree_json_buf.items;
 }
 
@@ -454,7 +466,7 @@ fn writeContainerJson(w: anytype, con: *tree.Container) !void {
 
     // id
     const id: u32 = if (con.window) |wd| wd.id else 0;
-    try std.fmt.format(w, "\"id\":{d}", .{id});
+    try w.print("\"id\":{d}", .{id});
 
     // type
     const type_str = switch (con.type) {
@@ -464,7 +476,7 @@ fn writeContainerJson(w: anytype, con: *tree.Container) !void {
         .split_con => "con",
         .window => "con",
     };
-    try std.fmt.format(w, ",\"type\":\"{s}\"", .{type_str});
+    try w.print(",\"type\":\"{s}\"", .{type_str});
 
     // name
     if (con.workspace) |wsd| {
@@ -484,13 +496,13 @@ fn writeContainerJson(w: anytype, con: *tree.Container) !void {
         .tabbed => "tabbed",
         .stacked => "stacked",
     };
-    try std.fmt.format(w, ",\"layout\":\"{s}\"", .{layout_str});
+    try w.print(",\"layout\":\"{s}\"", .{layout_str});
 
     // focused
-    try std.fmt.format(w, ",\"focused\":{}", .{con.is_focused});
+    try w.print(",\"focused\":{}", .{con.is_focused});
 
     // rect
-    try std.fmt.format(w, ",\"rect\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}}}", .{
+    try w.print(",\"rect\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d}}}", .{
         con.rect.x, con.rect.y, con.rect.w, con.rect.h,
     });
 
@@ -500,11 +512,11 @@ fn writeContainerJson(w: anytype, con: *tree.Container) !void {
     }
 
     // fullscreen
-    try std.fmt.format(w, ",\"fullscreen_mode\":{d}", .{@intFromEnum(con.is_fullscreen)});
+    try w.print(",\"fullscreen_mode\":{d}", .{@intFromEnum(con.is_fullscreen)});
 
     // window (X11 window ID)
     if (con.window) |wd| {
-        try std.fmt.format(w, ",\"window\":{d}", .{wd.id});
+        try w.print(",\"window\":{d}", .{wd.id});
         if (wd.class.len > 0) {
             try w.writeAll(",\"window_properties\":{\"class\":\"");
             try jsonEscapeWrite(w, wd.class);
@@ -531,14 +543,14 @@ fn writeContainerJson(w: anytype, con: *tree.Container) !void {
 /// Try to load config from standard paths. Returns null if no config found.
 fn loadConfig(allocator: std.mem.Allocator) ?config_mod.Config {
     // Search paths in order
-    const home = std.posix.getenv("HOME") orelse "";
-    const xdg_config = std.posix.getenv("XDG_CONFIG_HOME");
+    const home = getenv("HOME") orelse "";
+    const xdg_config = getenv("XDG_CONFIG_HOME");
 
     var path_buf: [512]u8 = undefined;
 
     // 1. XDG_CONFIG_HOME/zephwm/config
     if (xdg_config) |xdg| {
-        const len = (std.fmt.bufPrint(&path_buf, "{s}/zephwm/config", .{xdg}) catch "").len;
+        const len = (std.fmt.bufPrint(&path_buf, "{s}/zephwm/config", .{xdg}) catch @as([]u8, &[_]u8{})).len;
         if (len > 0) {
             if (readConfigFile(allocator, path_buf[0..len])) |cfg| return cfg;
         }
@@ -546,7 +558,7 @@ fn loadConfig(allocator: std.mem.Allocator) ?config_mod.Config {
 
     // 2. ~/.config/zephwm/config
     {
-        const len = (std.fmt.bufPrint(&path_buf, "{s}/.config/zephwm/config", .{home}) catch "").len;
+        const len = (std.fmt.bufPrint(&path_buf, "{s}/.config/zephwm/config", .{home}) catch @as([]u8, &[_]u8{})).len;
         if (len > 0) {
             if (readConfigFile(allocator, path_buf[0..len])) |cfg| return cfg;
         }
@@ -554,7 +566,7 @@ fn loadConfig(allocator: std.mem.Allocator) ?config_mod.Config {
 
     // 3. ~/.zephwm/config
     {
-        const len = (std.fmt.bufPrint(&path_buf, "{s}/.zephwm/config", .{home}) catch "").len;
+        const len = (std.fmt.bufPrint(&path_buf, "{s}/.zephwm/config", .{home}) catch @as([]u8, &[_]u8{})).len;
         if (len > 0) {
             if (readConfigFile(allocator, path_buf[0..len])) |cfg| return cfg;
         }
@@ -564,13 +576,13 @@ fn loadConfig(allocator: std.mem.Allocator) ?config_mod.Config {
     if (readConfigFile(allocator, "/etc/zephwm/config")) |cfg| return cfg;
 
     // No config found — generate default config at ~/.config/zephwm/config
-    const wrote_file = if (std.posix.getenv("HOME")) |h| blk: {
+    const wrote_file = if (getenv("HOME")) |h| blk: {
         const config_dir = std.fmt.allocPrint(allocator, "{s}/.config/zephwm", .{h}) catch break :blk false;
         defer allocator.free(config_dir);
-        std.fs.cwd().makePath(config_dir) catch break :blk false;
+        posix_compat.cwd().makePath(config_dir) catch break :blk false;
         const config_path = std.fmt.allocPrint(allocator, "{s}/.config/zephwm/config", .{h}) catch break :blk false;
         defer allocator.free(config_path);
-        const file = std.fs.createFileAbsolute(config_path, .{}) catch break :blk false;
+        const file = posix_compat.createFileAbsolute(config_path, .{}) catch break :blk false;
         defer file.close();
         file.writeAll(default_config) catch break :blk false;
         std.log.info("zephwm: generated default config at {s}", .{config_path});
@@ -585,7 +597,7 @@ fn loadConfig(allocator: std.mem.Allocator) ?config_mod.Config {
 }
 
 fn readConfigFile(allocator: std.mem.Allocator, path: []const u8) ?config_mod.Config {
-    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    const file = posix_compat.cwd().openFile(path, .{}) catch return null;
     defer file.close();
     const content = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
     defer allocator.free(content);
@@ -599,12 +611,12 @@ fn parseColor(color_str: []const u8) u32 {
     return std.fmt.parseInt(u32, s, 16) catch 0;
 }
 
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     // GPAはアロケーション毎に~32Bのメタデータを持つ。libc mallocで軽量化。
     const allocator = std.heap.c_allocator;
 
     // Parse args: --version, --help
-    var args = std.process.args();
+    var args = std.process.Args.Iterator.init(init.args);
     _ = args.next(); // skip argv[0]
     if (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--version") or std.mem.eql(u8, arg, "-v")) {
@@ -762,7 +774,7 @@ pub fn main() !void {
         std.debug.print("ERROR: cannot create IPC socket: {}\n", .{err});
         return err;
     };
-    defer std.posix.close(ipc_listen_fd);
+    defer posix_compat.close(ipc_listen_fd);
 
     // Set I3SOCK env var
     {
@@ -806,7 +818,7 @@ pub fn main() !void {
         std.debug.print("ERROR: epoll_create1 failed\n", .{});
         return error.EpollCreateFailed;
     }
-    defer std.posix.close(@intCast(epoll_fd));
+    defer posix_compat.close(@intCast(epoll_fd));
 
     // Add xcb fd to epoll
     const xcb_fd: i32 = xcb.getFd(conn);
@@ -849,7 +861,7 @@ pub fn main() !void {
         std.debug.print("ERROR: signalfd failed\n", .{});
         return error.SignalfdFailed;
     }
-    defer std.posix.close(@intCast(sig_fd));
+    defer posix_compat.close(@intCast(sig_fd));
 
     var sig_event = linux.epoll_event{
         .events = linux.EPOLL.IN,
@@ -892,7 +904,7 @@ pub fn main() !void {
 
     // 11. Run exec/exec_always commands from config
     // exec: only on fresh start (not restart). exec_always: always.
-    const is_restart = std.posix.getenv("ZEPHWM_RESTART") != null;
+    const is_restart = getenv("ZEPHWM_RESTART") != null;
     if (config) |cfg| {
         if (!is_restart) {
             for (cfg.exec_cmds.items) |exec_cmd| {
@@ -938,7 +950,7 @@ pub fn main() !void {
         const nfds_signed: isize = @bitCast(nfds);
 
         if (nfds_signed < 0) {
-            const err = linux.E.init(nfds);
+            const err = linux.errno(nfds);
             if (err == .INTR) continue;
             std.debug.print("ERROR: epoll_wait failed: {}\n", .{err});
             break;
@@ -1000,7 +1012,7 @@ pub fn main() !void {
                         };
                         const ctl_res = linux.epoll_ctl(@intCast(epoll_fd), linux.EPOLL.CTL_ADD, @intCast(client_fd), &client_ev);
                         if (@as(isize, @bitCast(ctl_res)) < 0) {
-                            std.posix.close(client_fd);
+                            posix_compat.close(client_fd);
                             break;
                         }
                         added = true;
@@ -1008,7 +1020,7 @@ pub fn main() !void {
                     }
                 }
                 if (!added) {
-                    std.posix.close(client_fd); // too many clients
+                    posix_compat.close(client_fd); // too many clients
                 }
             } else blk: {
                 // Check if this is an IPC client fd
@@ -1033,7 +1045,7 @@ pub fn main() !void {
                                         ipc_sub_masks[si] = 0;
                                     }
                                 }
-                                std.posix.close(ev.data.fd);
+                                posix_compat.close(ev.data.fd);
                                 slot.* = -1;
                                 break;
                             }
@@ -1053,7 +1065,7 @@ pub fn main() !void {
                     if (n_signed <= 0) break;
                     const info: *const linux.signalfd_siginfo = @ptrCast(&sigbuf);
                     switch (info.signo) {
-                        linux.SIG.CHLD => {
+                        @intFromEnum(linux.SIG.CHLD) => {
                             // Reap all zombie children using wait4(-1, ..., WNOHANG)
                             var wstatus: u32 = 0;
                             while (true) {
@@ -1062,16 +1074,16 @@ pub fn main() !void {
                                 if (res_signed <= 0) break; // no more zombies or error
                             }
                         },
-                        linux.SIG.TERM, linux.SIG.INT => {
+                        @intFromEnum(linux.SIG.TERM), @intFromEnum(linux.SIG.INT) => {
                             running = false;
                         },
-                        linux.SIG.HUP => {
+                        @intFromEnum(linux.SIG.HUP) => {
                             // Restart via re-exec (same as "restart" command)
                             event.executeRestart(&ctx);
                             // If re-exec failed, just exit
                             running = false;
                         },
-                        linux.SIG.USR1 => {
+                        @intFromEnum(linux.SIG.USR1) => {
                             // Reload config
                             std.debug.print("zephwm: SIGUSR1 received, reloading config\n", .{});
                             if (config) |*cfg| cfg.deinit();
@@ -1114,13 +1126,13 @@ pub fn main() !void {
     // Cleanup IPC clients
     for (&ipc_client_fds) |*slot| {
         if (slot.* != -1) {
-            std.posix.close(slot.*);
+            posix_compat.close(slot.*);
             slot.* = -1;
         }
     }
 
     // Remove socket file
-    std.posix.unlinkat(std.posix.AT.FDCWD, sock_path, 0) catch {};
+    posix_compat.unlinkat(std.posix.AT.FDCWD, sock_path, 0) catch {};
 
     // Free allocator-owned mode string (if not the static DEFAULT_MODE sentinel)
     if (ctx.current_mode.ptr != event.DEFAULT_MODE.ptr) {

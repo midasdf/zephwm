@@ -1,5 +1,6 @@
 // Bar management — spawn external bar process
 const std = @import("std");
+const posix_compat = @import("posix_compat");
 
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn setsid() std.c.pid_t;
@@ -25,17 +26,17 @@ pub fn spawnBar(status_command: []const u8, position: []const u8) void {
     cmd_buf[cmd_len] = 0;
     const cmd_z: [*:0]const u8 = @ptrCast(cmd_buf[0..cmd_len :0]);
 
-    const pid = std.posix.fork() catch return;
+    const pid = posix_compat.fork() catch return;
     if (pid == 0) {
         // Child process
         _ = setsid();
 
         // Redirect stderr to /dev/null to prevent tty pollution
         // (stdout is kept — zephwm-bar may use it for status protocol)
-        const devnull = std.posix.open("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch -1;
+        const devnull = posix_compat.openZ("/dev/null", .{ .ACCMODE = .WRONLY }, 0) catch -1;
         if (devnull >= 0) {
-            _ = std.posix.dup2(@intCast(devnull), 2) catch {}; // stderr only
-            std.posix.close(@intCast(devnull));
+            _ = posix_compat.dup2(@intCast(devnull), 2) catch {}; // stderr only
+            posix_compat.close(@intCast(devnull));
         }
 
         // Close inherited fds > stderr
