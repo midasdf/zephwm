@@ -5,9 +5,7 @@ const std = @import("std");
 const ipc = @import("ipc");
 const builtin_status = @import("builtin_status");
 
-const c = @cImport({
-    @cInclude("xcb/xcb.h");
-});
+const c = @import("c");
 
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 
@@ -122,16 +120,16 @@ fn queryBarConfig(allocator: std.mem.Allocator, sock_path: []const u8) BarConfig
 }
 
 const is_debug = @import("builtin").mode == .Debug;
-var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .{};
+var gpa_state: std.heap.DebugAllocator(.{}) = .init;
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     const allocator = if (is_debug) gpa_state.allocator() else std.heap.c_allocator;
     defer if (is_debug) {
         _ = gpa_state.deinit();
     };
 
     // Parse args
-    var args = std.process.args();
+    var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.next(); // skip argv[0]
     var socket_override: ?[]const u8 = null;
     var position_top = true;
@@ -178,8 +176,10 @@ pub fn main() !void {
     // 2. Discover IPC socket (needed before output discovery)
     var default_path_buf: [256]u8 = undefined;
     const default_path = ipc.getDefaultSocketPath(&default_path_buf);
-    const sock_path = socket_override orelse
-        (std.posix.getenv("I3SOCK") orelse default_path);
+    const sock_path = socket_override orelse blk: {
+        if (std.c.getenv("I3SOCK")) |p| break :blk std.mem.span(p);
+        break :blk default_path;
+    };
 
     // 3. Query IPC for bar config BEFORE creating windows/fonts
     const bar_cfg = queryBarConfig(allocator, sock_path);
@@ -367,7 +367,7 @@ pub fn main() !void {
         std.debug.print("zephwm-bar: epoll_create1 failed\n", .{});
         return;
     }
-    defer std.posix.close(@intCast(epoll_fd));
+    defer ipc.posix_compat.close(@intCast(epoll_fd));
 
     // Add status pipe fd to epoll if available
     if (status_pipe_fd >= 0) {
@@ -398,7 +398,7 @@ pub fn main() !void {
         const nfds_signed: isize = @bitCast(nfds);
 
         if (nfds_signed < 0) {
-            const err = linux.E.init(nfds);
+            const err = linux.errno(nfds);
             if (err == .INTR) continue;
             break;
         }
@@ -441,7 +441,7 @@ pub fn main() !void {
 
         if (builtin_mode) {
             // Built-in status mode: update modules based on elapsed time
-            const now = std.time.timestamp();
+            const now = ipc.posix_compat.timestamp();
             module_state.dirty = false;
             builtin_status.updateAll(&module_state, now, &module_outputs);
 
@@ -467,7 +467,7 @@ pub fn main() !void {
                 parseStatusUpdate(status_pipe_fd, &status_blocks, &status_block_count, &click_events_enabled, &json_mode, &status_read_buf, &status_read_len);
                 // When click_events first enabled, send the opening bracket
                 if (click_events_enabled and !prev_click_enabled and status_stdin_fd >= 0) {
-                    _ = std.posix.write(status_stdin_fd, "[\n") catch {};
+                    _ = ipc.posix_compat.write(status_stdin_fd, "[\n") catch {};
                 }
             }
         }
@@ -742,8 +742,8 @@ fn handleClick(
             if (click_x >= bx and click_x < bx + bw) {
                 // Send click event to status_command stdin
                 var click_buf: [512]u8 = undefined;
-                var click_fbs = std.io.fixedBufferStream(&click_buf);
-                const cw = click_fbs.writer();
+                var click_fbs = std.Io.Writer.fixed(&click_buf);
+                const cw = &click_fbs;
                 cw.writeAll(",{\"name\":\"") catch {};
                 jsonEscapeWrite(cw, blk.name[0..blk.name_len]) catch {};
                 cw.writeAll("\",\"instance\":\"") catch {};
@@ -755,7 +755,7 @@ fn handleClick(
                 }) catch {};
                 cw.print(",\"width\":{d},\"height\":{d}", .{ bw_val, bar_height }) catch {};
                 cw.writeAll("}\n") catch {};
-                _ = std.posix.write(status_stdin_fd, click_fbs.getWritten()) catch {};
+                _ = ipc.posix_compat.write(status_stdin_fd, click_fbs.buffered()) catch {};
                 break;
             }
         }
@@ -843,11 +843,11 @@ fn internAtom(conn: *c.xcb_connection_t, name: [*:0]const u8) u32 {
 /// Spawn status_command via fork+pipe, returning both stdout (read) and stdin (write) fds.
 fn spawnStatusCommand(cmd: []const u8) struct { stdout_fd: std.posix.fd_t, stdin_fd: std.posix.fd_t } {
     // stdout pipe (bar reads)
-    const stdout_pipe = std.posix.pipe() catch return .{ .stdout_fd = -1, .stdin_fd = -1 };
+    const stdout_pipe = ipc.posix_compat.pipe() catch return .{ .stdout_fd = -1, .stdin_fd = -1 };
     // stdin pipe (bar writes)
-    const stdin_pipe = std.posix.pipe() catch {
-        std.posix.close(stdout_pipe[0]);
-        std.posix.close(stdout_pipe[1]);
+    const stdin_pipe = ipc.posix_compat.pipe() catch {
+        ipc.posix_compat.close(stdout_pipe[0]);
+        ipc.posix_compat.close(stdout_pipe[1]);
         return .{ .stdout_fd = -1, .stdin_fd = -1 };
     };
 
@@ -857,22 +857,22 @@ fn spawnStatusCommand(cmd: []const u8) struct { stdout_fd: std.posix.fd_t, stdin
     cmd_buf[cmd_len] = 0;
     const cmd_z: [*:0]const u8 = @ptrCast(cmd_buf[0..cmd_len :0]);
 
-    const pid = std.posix.fork() catch {
-        std.posix.close(stdout_pipe[0]);
-        std.posix.close(stdout_pipe[1]);
-        std.posix.close(stdin_pipe[0]);
-        std.posix.close(stdin_pipe[1]);
+    const pid = ipc.posix_compat.fork() catch {
+        ipc.posix_compat.close(stdout_pipe[0]);
+        ipc.posix_compat.close(stdout_pipe[1]);
+        ipc.posix_compat.close(stdin_pipe[0]);
+        ipc.posix_compat.close(stdin_pipe[1]);
         return .{ .stdout_fd = -1, .stdin_fd = -1 };
     };
 
     if (pid == 0) {
         // Child
-        std.posix.close(stdout_pipe[0]); // close read end of stdout
-        std.posix.close(stdin_pipe[1]); // close write end of stdin
+        ipc.posix_compat.close(stdout_pipe[0]); // close read end of stdout
+        ipc.posix_compat.close(stdin_pipe[1]); // close write end of stdin
         _ = std.c.dup2(stdout_pipe[1], 1); // stdout = pipe
         _ = std.c.dup2(stdin_pipe[0], 0); // stdin = pipe
-        std.posix.close(stdout_pipe[1]);
-        std.posix.close(stdin_pipe[0]);
+        ipc.posix_compat.close(stdout_pipe[1]);
+        ipc.posix_compat.close(stdin_pipe[0]);
 
         const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmd_z };
         _ = execvp("/bin/sh", &argv);
@@ -880,12 +880,12 @@ fn spawnStatusCommand(cmd: []const u8) struct { stdout_fd: std.posix.fd_t, stdin
     }
 
     // Parent
-    std.posix.close(stdout_pipe[1]); // close write end of stdout
-    std.posix.close(stdin_pipe[0]); // close read end of stdin
+    ipc.posix_compat.close(stdout_pipe[1]); // close write end of stdout
+    ipc.posix_compat.close(stdin_pipe[0]); // close read end of stdin
 
     // Set stdout read to non-blocking
-    const flags = std.posix.fcntl(stdout_pipe[0], std.posix.F.GETFL, 0) catch return .{ .stdout_fd = stdout_pipe[0], .stdin_fd = stdin_pipe[1] };
-    _ = std.posix.fcntl(stdout_pipe[0], std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))) catch {};
+    const flags = ipc.posix_compat.fcntl(stdout_pipe[0], std.posix.F.GETFL, 0) catch return .{ .stdout_fd = stdout_pipe[0], .stdin_fd = stdin_pipe[1] };
+    _ = ipc.posix_compat.fcntl(stdout_pipe[0], std.posix.F.SETFL, flags | @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))) catch {};
 
     std.debug.print("zephwm-bar: spawned status_command (pid {d})\n", .{pid});
     return .{ .stdout_fd = stdout_pipe[0], .stdin_fd = stdin_pipe[1] };

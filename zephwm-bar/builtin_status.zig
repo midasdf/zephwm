@@ -1,8 +1,7 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("time.h");
-});
+const c = @import("c");
+const posix_compat = @import("posix_compat");
 
 const posix = std.posix;
 
@@ -67,7 +66,7 @@ pub const MODULE_COUNT: usize = 7;
 
 /// Read file content into buffer, returning the slice or null on failure.
 pub fn readFileContent(path: []const u8, buf: []u8) ?[]const u8 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    const file = posix_compat.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
     const n = file.read(buf) catch return null;
     return buf[0..n];
@@ -177,7 +176,7 @@ pub fn updateAll(state: *ModuleState, now: i64, outputs: *[MODULE_COUNT]ModuleOu
 
     // --- Clock (index 6) ---
     {
-        const epoch = std.time.timestamp();
+        const epoch = posix_compat.timestamp();
         var c_time: c.time_t = @intCast(epoch);
         var tm: c.struct_tm = undefined;
         _ = c.localtime_r(&c_time, &tm);
@@ -196,7 +195,7 @@ pub fn updateAll(state: *ModuleState, now: i64, outputs: *[MODULE_COUNT]ModuleOu
 /// Iterate /sys/class/power_supply/ to find a Battery and return its capacity.
 fn findBatteryCapacity() ?u8 {
     const base_path = "/sys/class/power_supply";
-    var dir = std.fs.openDirAbsolute(base_path, .{ .iterate = true }) catch return null;
+    var dir = posix_compat.openDirAbsolute(base_path, .{}) catch return null;
     defer dir.close();
 
     var iter = dir.iterate();
@@ -246,8 +245,8 @@ comptime {
 /// Get SSID from a wireless interface via ioctl SIOCGIWESSID.
 pub fn getSsid(iface_name: []const u8) ?SsidBuf {
     // Open a DGRAM socket for ioctl
-    const sock = posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return null;
-    defer posix.close(sock);
+    const sock = posix_compat.socket(posix.AF.INET, posix.SOCK.DGRAM, 0) catch return null;
+    defer posix_compat.close(sock);
 
     var essid_buf: [IW_ESSID_MAX_SIZE + 1]u8 = .{0} ** (IW_ESSID_MAX_SIZE + 1);
     var req: IwreqRaw = std.mem.zeroes(IwreqRaw);
@@ -282,7 +281,7 @@ pub fn getSsid(iface_name: []const u8) ?SsidBuf {
 /// Prefers an interface whose operstate is "up" over a down one.
 pub fn discoverWirelessInterface() ?[16]u8 {
     const base_path = "/sys/class/net";
-    var dir = std.fs.openDirAbsolute(base_path, .{ .iterate = true }) catch return null;
+    var dir = posix_compat.openDirAbsolute(base_path, .{}) catch return null;
     defer dir.close();
 
     var fallback: ?[16]u8 = null;
@@ -296,7 +295,7 @@ pub fn discoverWirelessInterface() ?[16]u8 {
         const check_path = std.fmt.bufPrint(&check_path_buf, "{s}/{s}/wireless", .{ base_path, entry.name }) catch continue;
 
         // Try to stat the wireless directory
-        std.fs.accessAbsolute(check_path, .{}) catch continue;
+        posix_compat.accessAbsolute(check_path, .{}) catch continue;
 
         // Found a wireless interface — check if it's up
         var result: [16]u8 = .{0} ** 16;
@@ -313,7 +312,7 @@ pub fn discoverWirelessInterface() ?[16]u8 {
             if (fallback == null) fallback = result;
             continue;
         };
-        const oper = std.mem.trimRight(u8, oper_content, &.{ '\n', ' ' });
+        const oper = std.mem.trimEnd(u8, oper_content, &.{ '\n', ' ' });
         if (std.mem.eql(u8, oper, "up")) {
             return result; // Prefer the up interface
         }
@@ -327,22 +326,11 @@ pub fn discoverWirelessInterface() ?[16]u8 {
 /// Get IME state by running fcitx5-remote -n.
 /// Returns the IM name classification (japanese, direct, or unavailable).
 pub fn getImeStateViaRemote() ImeState {
-    const argv: []const []const u8 = &.{ "fcitx5-remote", "-n" };
-    var child = std.process.Child.init(argv, std.heap.page_allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return .unavailable;
-
+    const argv: []const [*:0]const u8 = &.{ "fcitx5-remote", "-n" };
     var buf: [128]u8 = undefined;
-    const stdout = child.stdout orelse {
-        _ = child.wait() catch {};
-        return .unavailable;
-    };
-    const n = stdout.read(&buf) catch 0;
-    _ = child.wait() catch {};
-
-    if (n == 0) return .unavailable;
-    const im_name = std.mem.trimRight(u8, buf[0..n], &.{ '\n', ' ' });
+    const out = posix_compat.runCaptureStdout(argv, &buf) orelse return .unavailable;
+    if (out.len == 0) return .unavailable;
+    const im_name = std.mem.trimEnd(u8, out, &.{ '\n', ' ' });
     return classifyIme(im_name);
 }
 
@@ -479,12 +467,12 @@ pub fn truncateSsid(ssid: []const u8) SsidBuf {
 // --- Task 12: Battery ---
 
 pub fn parseBatteryCapacity(content: []const u8) u8 {
-    const trimmed = std.mem.trimRight(u8, content, &.{ '\n', ' ' });
+    const trimmed = std.mem.trimEnd(u8, content, &.{ '\n', ' ' });
     return std.fmt.parseInt(u8, trimmed, 10) catch 0;
 }
 
 pub fn isBatteryType(content: []const u8) bool {
-    const trimmed = std.mem.trimRight(u8, content, &.{ '\n', ' ' });
+    const trimmed = std.mem.trimEnd(u8, content, &.{ '\n', ' ' });
     return std.mem.eql(u8, trimmed, "Battery");
 }
 

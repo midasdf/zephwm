@@ -138,7 +138,7 @@ pub const Config = struct {
         var line_iter = std.mem.splitScalar(u8, text, '\n');
         while (line_iter.next()) |raw_line| {
             // Trim trailing \r
-            const line_cr = std.mem.trimRight(u8, raw_line, "\r");
+            const line_cr = std.mem.trimEnd(u8, raw_line, "\r");
             // Trim leading/trailing whitespace
             const line_trimmed = std.mem.trim(u8, line_cr, " \t");
 

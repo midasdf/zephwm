@@ -12,6 +12,7 @@ const scratchpad = @import("scratchpad.zig");
 const criteria = @import("criteria.zig");
 const layout = @import("layout.zig");
 const render = @import("render.zig");
+const posix_compat = @import("posix_compat");
 const output = @import("output.zig");
 const ipc = @import("ipc.zig");
 
@@ -113,7 +114,7 @@ pub fn broadcastIpcEvent(ctx: *EventContext, event_type: ipc.EventType, payload:
 
     for (0..MAX_IPC_SUBS) |i| {
         if (ctx.ipc_sub_fds[i] != -1 and (ctx.ipc_sub_masks[i] & mask_bit) != 0) {
-            _ = std.posix.write(ctx.ipc_sub_fds[i], msg) catch {
+            _ = posix_compat.write(ctx.ipc_sub_fds[i], msg) catch {
                 // Client disconnected, will be cleaned up by main loop
             };
         }
@@ -1175,8 +1176,8 @@ fn handleKeyPress(ctx: *EventContext, ev: *xcb.KeyPressEvent) void {
             // Broadcast binding event only if there are subscribers (skip JSON formatting otherwise)
             if (hasIpcSubscribers(ctx, IPC_EVENT_BINDING)) {
                 var bind_buf: [512]u8 = undefined;
-                var bind_fbs = std.io.fixedBufferStream(&bind_buf);
-                const bind_w = bind_fbs.writer();
+                var bind_fbs = std.Io.Writer.fixed(&bind_buf);
+                const bind_w = &bind_fbs;
                 bind_w.writeAll("{\"change\":\"run\",\"binding\":{\"command\":\"") catch {};
                 jsonEscapeWrite(bind_w, kb.command) catch {};
                 bind_w.writeAll("\",\"event_state_mask\":[") catch {};
@@ -1204,7 +1205,7 @@ fn handleKeyPress(ctx: *EventContext, ev: *xcb.KeyPressEvent) void {
                 bind_w.writeAll("],\"input_type\":\"keyboard\",\"symbol\":\"") catch {};
                 jsonEscapeWrite(bind_w, name) catch {};
                 bind_w.writeAll("\"}}") catch {};
-                const bind_json = bind_fbs.getWritten();
+                const bind_json = bind_fbs.buffered();
                 if (bind_json.len > 0 and bind_json.len < bind_buf.len) broadcastIpcEvent(ctx, .binding, bind_json);
             }
             // Parse and execute command
@@ -2115,15 +2116,15 @@ fn executeWorkspace(ctx: *EventContext, cmd: command_mod.Command) void {
                             relayoutAndRender(ctx);
                             {
                                 var baf_ev_buf: [256]u8 = undefined;
-                                var baf_ev_fbs = std.io.fixedBufferStream(&baf_ev_buf);
-                                const baf_ev_w = baf_ev_fbs.writer();
+                                var baf_ev_fbs = std.Io.Writer.fixed(&baf_ev_buf);
+                                const baf_ev_w = &baf_ev_fbs;
                                 baf_ev_w.writeAll("{\"change\":\"focus\",\"current\":{\"name\":\"") catch {};
                                 const baf_ws_name = if (prev_ws.workspace) |wsd| wsd.name else "?";
                                 jsonEscapeWrite(baf_ev_w, baf_ws_name) catch {};
                                 baf_ev_w.writeAll("\",\"output\":\"") catch {};
                                 jsonEscapeWrite(baf_ev_w, getWorkspaceOutputName(prev_ws)) catch {};
                                 baf_ev_w.writeAll("\"}}") catch {};
-                                const baf_ev_json = baf_ev_fbs.getWritten();
+                                const baf_ev_json = baf_ev_fbs.buffered();
                                 if (baf_ev_json.len > 0) broadcastIpcEvent(ctx, .workspace, baf_ev_json);
                             }
                         }
@@ -2167,14 +2168,14 @@ fn executeWorkspace(ctx: *EventContext, cmd: command_mod.Command) void {
         // Broadcast workspace event (with JSON-escaped name)
         const ws_name = if (target_ws.workspace) |wsd| wsd.name else "?";
         var ev_buf: [256]u8 = undefined;
-        var ev_fbs = std.io.fixedBufferStream(&ev_buf);
-        const ev_w = ev_fbs.writer();
+        var ev_fbs = std.Io.Writer.fixed(&ev_buf);
+        const ev_w = &ev_fbs;
         ev_w.writeAll("{\"change\":\"focus\",\"current\":{\"name\":\"") catch {};
         jsonEscapeWrite(ev_w, ws_name) catch {};
         ev_w.writeAll("\",\"output\":\"") catch {};
         jsonEscapeWrite(ev_w, getWorkspaceOutputName(target_ws)) catch {};
         ev_w.writeAll("\"}}") catch {};
-        const ev_json = ev_fbs.getWritten();
+        const ev_json = ev_fbs.buffered();
         if (ev_json.len > 0) broadcastIpcEvent(ctx, .workspace, ev_json);
     }
 }
@@ -2291,7 +2292,7 @@ fn executeExec(cmd: command_mod.Command) void {
     cmd_buf[actual_cmd.len] = 0;
     const cmd_z: [*:0]const u8 = @ptrCast(cmd_buf[0..actual_cmd.len :0]);
 
-    const pid = std.posix.fork() catch return;
+    const pid = posix_compat.fork() catch return;
     if (pid == 0) {
         // Child process
         _ = setsid();
@@ -2719,7 +2720,7 @@ pub fn executeRestart(ctx: *EventContext) void {
     // Must succeed before we unreparent anything — if it fails, abort cleanly
     // so the WM continues running in a valid state.
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = std.fs.readLinkAbsolute("/proc/self/exe", &exe_buf) catch {
+    const exe_path = posix_compat.readLinkAbsolute("/proc/self/exe", &exe_buf) catch {
         log.err("restart failed: cannot read /proc/self/exe", .{});
         return;
     };
@@ -2759,12 +2760,12 @@ fn executeMode(ctx: *EventContext, cmd: command_mod.Command) void {
 
     // Broadcast mode event (with JSON-escaped name)
     var ev_buf: [128]u8 = undefined;
-    var ev_fbs = std.io.fixedBufferStream(&ev_buf);
-    const ev_w = ev_fbs.writer();
+    var ev_fbs = std.Io.Writer.fixed(&ev_buf);
+    const ev_w = &ev_fbs;
     ev_w.writeAll("{\"change\":\"") catch {};
     jsonEscapeWrite(ev_w, duped) catch {};
     ev_w.writeAll("\"}") catch {};
-    const ev_json = ev_fbs.getWritten();
+    const ev_json = ev_fbs.buffered();
     if (ev_json.len > 0) broadcastIpcEvent(ctx, .mode, ev_json);
 }
 
