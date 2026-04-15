@@ -15,7 +15,7 @@ const linux = std.os.linux;
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
-const VERSION = "0.1.0";
+const VERSION = "0.5.1";
 
 /// Zig 0.16: std.posix.getenv was removed. Use libc getenv via std.c.
 fn getenv(name: [:0]const u8) ?[]const u8 {

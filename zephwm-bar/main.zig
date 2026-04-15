@@ -9,7 +9,7 @@ const c = @import("c");
 
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 
-const VERSION = "0.1.0";
+const VERSION = "0.5.1";
 
 // Colors (raw pixel values — no XftColor needed)
 const BG_COLOR: u32 = 0x1a1a2e;

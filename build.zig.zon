@@ -1,6 +1,6 @@
 .{
     .name = .zephwm,
-    .version = "0.5.0",
+    .version = "0.5.1",
     .fingerprint = 0x342fbfe9e4dd8c27,
     .minimum_zig_version = "0.16.0",
     .paths = .{ "build.zig", "build.zig.zon", "src", "zephwm-msg", "zephwm-bar", "tests", "config" },

@@ -2,7 +2,7 @@
 const std = @import("std");
 const ipc = @import("ipc");
 
-const VERSION = "0.1.0";
+const VERSION = "0.5.1";
 
 fn usage() void {
     std.debug.print(
